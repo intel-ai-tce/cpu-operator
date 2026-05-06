@@ -1,219 +1,167 @@
 # CPU Operator Demo
 
-This package contains a minimal **CPU Operator** and **Node topology agent** example for Kubernetes/OpenShift.
+Minimal OpenShift/Kubernetes CPU Operator proof-of-concept.
 
-The design intentionally avoids NRI and treats DRA as optional.
+This demo avoids NRI and treats DRA as optional. It does **not** modify real kubelet settings yet. It discovers worker-node CPU/NUMA topology, computes a recommended `reservedSystemCPUs` value, and stores the result in a ConfigMap.
 
-## Architecture
+## Components
 
 ```text
 Node topology agent DaemonSet
-  -> runs on each worker node
+  -> runs on every worker node
   -> reads /sys CPU and NUMA topology
   -> writes NodeCPUTopology.status
 
-CPU Operator
-  -> runs as a Deployment in cpu-operator-system
+CPU Operator Deployment
   -> watches NodeCPUTopology and CPUPlacementPolicy
   -> computes NUMA-balanced reservedSystemCPUs
-  -> writes a ConfigMap with the computed policy
-
-Kubelet CPU Manager / Topology Manager
-  -> not modified directly by this demo
-  -> production operator would generate OpenShift KubeletConfig or PerformanceProfile
+  -> writes <policy-name>-computed-cpu-policy ConfigMap
 ```
 
 ## Files
 
 ```text
-.
-├── crds.yaml
-├── rbac.yaml
-├── agent/
-│   ├── agent.py
-│   ├── Dockerfile
-│   └── daemonset.yaml
-├── operator/
-│   ├── operator.py
-│   ├── Dockerfile
-│   └── deployment.yaml
-├── examples/
-│   ├── cpu-placement-policy.yaml
-│   └── fake-node-topology.yaml
-└── scripts/
-    ├── build-and-push.sh
-    ├── deploy.sh
-    └── cleanup.sh
-```
-
-## Prerequisites
-
-You need:
-
-- `oc` or `kubectl`
-- `podman` or compatible container builder
-- access to a container registry
-- cluster-admin or equivalent permissions for CRDs/RBAC
-- OpenShift SCC permission if using the real DaemonSet with `/sys` hostPath
-
-## Quick start on OpenShift
-
-### 1. Set registry
-
-```bash
-export REGISTRY=quay.io/YOUR_ORG
-```
-
-Edit image names in:
-
-```text
+crds.yaml
+rbac.yaml
 agent/daemonset.yaml
 operator/deployment.yaml
+examples/cpu-placement-policy.yaml
+scripts/sanity-check.sh
+docs/README_internal_registry.md
+docs/README_external_registry.md
 ```
 
-Replace:
+## Required fixes
 
-```text
-quay.io/YOUR_ORG
-```
-
-with your real registry path.
-
-### 2. Build and push images
+Validate the bad Kopf logging setting is absent:
 
 ```bash
-chmod +x scripts/*.sh
-REGISTRY=$REGISTRY ./scripts/build-and-push.sh
+grep -n 'settings.posting.level = "INFO"' operator/operator.py || echo "OK"
 ```
 
-### 3. Apply CRDs and RBAC
+Validate RBAC after applying `rbac.yaml`:
+
+```bash
+oc auth can-i list namespaces \
+  --as system:serviceaccount:cpu-operator-system:cpu-operator
+
+oc auth can-i list customresourcedefinitions.apiextensions.k8s.io \
+  --as system:serviceaccount:cpu-operator-system:cpu-operator
+```
+
+Expected:
+
+```text
+yes
+yes
+```
+
+## Worker-node scheduling
+
+The topology agent runs on all worker nodes:
+
+```yaml
+nodeSelector:
+  node-role.kubernetes.io/worker: ""
+```
+
+Check workers:
+
+```bash
+oc get nodes -l node-role.kubernetes.io/worker=
+```
+
+## Registry setup
+
+Choose one registry guide:
+
+```text
+docs/README_internal_registry.md
+docs/README_external_registry.md
+```
+
+## Deploy
+
+After image names are updated in `agent/daemonset.yaml` and `operator/deployment.yaml`:
 
 ```bash
 oc apply -f crds.yaml
 oc apply -f rbac.yaml
-```
 
-### 4. Allow hostPath access for the topology agent on OpenShift
-
-The agent mounts `/sys` read-only. On OpenShift, the default SCC may block this.
-
-For a lab cluster:
-
-```bash
 oc adm policy add-scc-to-user privileged \
   -z node-topology-agent \
   -n cpu-operator-system
-```
 
-### 5. Deploy components
-
-```bash
 oc apply -f agent/daemonset.yaml
 oc apply -f operator/deployment.yaml
-```
-
-Check pods:
-
-```bash
-oc get pods -n cpu-operator-system -o wide
-oc logs -n cpu-operator-system ds/node-topology-agent
-oc logs -n cpu-operator-system deploy/cpu-operator
-```
-
-### 6. Verify topology objects
-
-```bash
-oc get nodecputopologies -n cpu-operator-system
-oc get nodecputopologies -n cpu-operator-system -o yaml
-```
-
-### 7. Apply CPUPlacementPolicy
-
-```bash
 oc apply -f examples/cpu-placement-policy.yaml
 ```
 
-Check computed policy:
+## CPUPlacementPolicy
 
-```bash
-oc get cm vllm-cpu-policy-computed-cpu-policy \
-  -n cpu-operator-system \
-  -o yaml
-```
-
-For a topology like:
-
-```text
-NUMA node0: 0-42,172-214
-NUMA node1: 43-85,215-257
-NUMA node2: 86-128,258-300
-NUMA node3: 129-171,301-343
-```
-
-With:
+`examples/cpu-placement-policy.yaml` is the input policy that triggers computation:
 
 ```yaml
-systemReserved:
-  logicalCPUsPerNuma: 40
+apiVersion: cpu.example.com/v1alpha1
+kind: CPUPlacementPolicy
+metadata:
+  name: vllm-cpu-policy
+  namespace: cpu-operator-system
+spec:
+  cpuManagerPolicy: static
+  topologyManagerPolicy: restricted
+  systemReserved:
+    logicalCPUsPerNuma: 40
+  nodeSelector:
+    node-role.kubernetes.io/worker: ""
 ```
 
-The computed result should look similar to:
+The output ConfigMap is:
 
 ```text
-0-19,43-62,86-105,129-148,172-191,215-234,258-277,301-320
+vllm-cpu-policy-computed-cpu-policy
 ```
 
-## Test without deploying the DaemonSet
-
-You can test the operator logic with fake topology.
+View it:
 
 ```bash
-oc apply -f crds.yaml
-oc apply -f rbac.yaml
-oc apply -f operator/deployment.yaml
-
-oc apply -f examples/fake-node-topology.yaml
-oc apply -f examples/cpu-placement-policy.yaml
-
 oc get cm vllm-cpu-policy-computed-cpu-policy \
   -n cpu-operator-system \
   -o yaml
+```
+
+## Sanity test
+
+Run:
+
+```bash
+./scripts/sanity-check.sh
+```
+
+Optional variables:
+
+```bash
+NAMESPACE=cpu-operator-system POLICY=vllm-cpu-policy ./scripts/sanity-check.sh
+```
+
+The script checks:
+
+```text
+Pods are Running
+node-topology-agent count vs worker-node count
+CPU Operator RBAC
+NodeCPUTopology readiness and CPU/NUMA fields
+CPUPlacementPolicy existence
+computed ConfigMap existence
+computed reservedSystemCPUs matches NodeCPUTopology + CPUPlacementPolicy
+oc logs availability, as a warning only
 ```
 
 ## Important limitation
 
-This demo does **not** patch OpenShift `KubeletConfig` directly. It only writes an example computed ConfigMap.
+The generated ConfigMap does not change worker nodes directly. It is a computed recommendation.
 
-A production CPU Operator would create/patch objects such as:
-
-```yaml
-apiVersion: machineconfiguration.openshift.io/v1
-kind: KubeletConfig
-metadata:
-  name: inference-cpu-manager
-spec:
-  machineConfigPoolSelector:
-    matchLabels:
-      pools.operator.machineconfiguration.openshift.io/inference: ""
-  kubeletConfig:
-    cpuManagerPolicy: static
-    topologyManagerPolicy: restricted
-    topologyManagerScope: pod
-    reservedSystemCPUs: "0-19,43-62,86-105,129-148,172-191,215-234,258-277,301-320"
-```
-
-Be careful: applying `KubeletConfig` can trigger MachineConfig rollout and node reboot.
-
-## Component ownership
-
-| Component | Responsibility | Where it runs |
-|---|---|---|
-| CPU Operator | Policy automation, topology-aware CPU placement orchestration, kubelet config generation, workload validation | Control plane / operator namespace |
-| Node topology agent | Discover and report CPU / NUMA / memory topology to CPU Operator | Worker node DaemonSet |
-| CPU Management Policy | Pin CPUs for eligible Guaranteed containers / enforce static CPU allocation | Inside kubelet on worker node |
-| Topology Manager | Align CPU and device resources with NUMA topology | Inside kubelet on worker node |
-| DRA optional | Claim-based resource allocation and scheduler-visible placement hints | Control-plane APIs plus optional driver on worker node |
-| Linux cgroups / cpuset | Final CPU enforcement | Worker node Linux kernel |
+To affect worker nodes in production, a later operator version would create or patch OpenShift `KubeletConfig` / `PerformanceProfile`, causing MachineConfig rollout and kubelet CPU Manager/Topology Manager configuration.
 
 ## Cleanup
 

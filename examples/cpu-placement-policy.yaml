@@ -13,4 +13,4 @@ spec:
     logicalCPUsPerNuma: 40
 
   nodeSelector:
-    node-role.kubernetes.io/inference: ""
+    node-role.kubernetes.io/worker: ""
