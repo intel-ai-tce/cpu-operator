@@ -1,0 +1,42 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: node-topology-agent
+  namespace: cpu-operator-system
+spec:
+  selector:
+    matchLabels:
+      app: node-topology-agent
+  template:
+    metadata:
+      labels:
+        app: node-topology-agent
+    spec:
+      serviceAccountName: node-topology-agent
+
+      # Run on all OpenShift worker nodes.
+      nodeSelector:
+        node-role.kubernetes.io/worker: ""
+
+      containers:
+        - name: agent
+          image: image-registry.openshift-image-registry.svc:5000/cpu-operator-images/node-topology-agent:dev
+          imagePullPolicy: Always
+          env:
+            - name: NAMESPACE
+              value: cpu-operator-system
+            - name: INTERVAL_SECONDS
+              value: "60"
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          volumeMounts:
+            - name: host-sys
+              mountPath: /host-sys
+              readOnly: true
+      volumes:
+        - name: host-sys
+          hostPath:
+            path: /sys
+            type: Directory

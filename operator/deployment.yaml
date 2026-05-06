@@ -1,0 +1,20 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cpu-operator
+  namespace: cpu-operator-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cpu-operator
+  template:
+    metadata:
+      labels:
+        app: cpu-operator
+    spec:
+      serviceAccountName: cpu-operator
+      containers:
+        - name: operator
+          image: image-registry.openshift-image-registry.svc:5000/cpu-operator-images/cpu-operator:dev
+          imagePullPolicy: Always

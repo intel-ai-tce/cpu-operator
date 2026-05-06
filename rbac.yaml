@@ -1,0 +1,102 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: cpu-operator-system
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: node-topology-agent
+  namespace: cpu-operator-system
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cpu-operator
+  namespace: cpu-operator-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: cpu-operator-demo
+rules:
+  - apiGroups:
+      - cpu.example.com
+    resources:
+      - nodecputopologies
+      - nodecputopologies/status
+      - cpuplacementpolicies
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - update
+      - patch
+
+  - apiGroups:
+      - ""
+    resources:
+      - nodes
+      - configmaps
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - update
+      - patch
+
+  # Needed by Kopf for namespace discovery.
+  - apiGroups:
+      - ""
+    resources:
+      - namespaces
+    verbs:
+      - get
+      - list
+      - watch
+
+  # Needed by Kopf for CRD discovery.
+  - apiGroups:
+      - apiextensions.k8s.io
+    resources:
+      - customresourcedefinitions
+    verbs:
+      - get
+      - list
+      - watch
+
+  - apiGroups:
+      - ""
+    resources:
+      - events
+    verbs:
+      - create
+      - patch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: node-topology-agent-demo
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cpu-operator-demo
+subjects:
+  - kind: ServiceAccount
+    name: node-topology-agent
+    namespace: cpu-operator-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: cpu-operator-demo
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cpu-operator-demo
+subjects:
+  - kind: ServiceAccount
+    name: cpu-operator
+    namespace: cpu-operator-system

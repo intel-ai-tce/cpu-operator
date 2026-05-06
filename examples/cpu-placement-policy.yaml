@@ -1,0 +1,16 @@
+apiVersion: cpu.example.com/v1alpha1
+kind: CPUPlacementPolicy
+metadata:
+  name: vllm-cpu-policy
+  namespace: cpu-operator-system
+spec:
+  cpuManagerPolicy: static
+  topologyManagerPolicy: restricted
+
+  # For a 4-NUMA-node system, 40 logical CPUs per NUMA creates
+  # a total reserved pool of 160 logical CPUs.
+  systemReserved:
+    logicalCPUsPerNuma: 40
+
+  nodeSelector:
+    node-role.kubernetes.io/inference: ""
