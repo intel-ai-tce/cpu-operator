@@ -13,6 +13,16 @@ spec:
     enabled: true
     prefix: cpu.example.com
 
+  # Phase 4 generates OpenShift MachineConfigPool + KubeletConfig per topology group.
+  # Safe default: generate only, do not apply.
+  # Set apply: true only after you are ready for Machine Config Operator rollout/reboot.
+  phase4:
+    enabled: true
+    apply: false
+    machineConfigPoolNamePrefix: cpu
+    topologyManagerScope: pod
+    pauseMachineConfigPool: false
+
   classification:
     # Optional explicit override per node.
     # Valid values:

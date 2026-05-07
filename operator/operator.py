@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 
-from typing import Dict, List, Any, Tuple
+from typing import Dict, List, Any, Tuple, Optional
+import re
+
 import kopf
 import yaml
 from kubernetes import client, config
@@ -9,6 +11,12 @@ from kubernetes.client.rest import ApiException
 GROUP = "cpu.example.com"
 VERSION = "v1alpha1"
 TOPOLOGY_PLURAL = "nodecputopologies"
+
+MCO_GROUP = "machineconfiguration.openshift.io"
+MCO_VERSION = "v1"
+MCP_PLURAL = "machineconfigpools"
+KUBELETCONFIG_PLURAL = "kubeletconfigs"
+
 VALID_CLASSES = {"mixed-cpu-amx-gpu", "cpu-amx", "cpu-only", "gpu-only"}
 
 
@@ -43,15 +51,15 @@ def compress_cpuset(cpus: List[int]) -> str:
 
 
 def subtract_cpuset(all_cpus: List[int], remove: List[int]) -> List[int]:
-    r = set(remove)
-    return [c for c in sorted(set(all_cpus)) if c not in r]
+    remove_set = set(remove)
+    return [c for c in sorted(set(all_cpus)) if c not in remove_set]
 
 
 def split_cpuset_groups(cpuset: str) -> List[List[int]]:
     return [expand_cpuset(p.strip()) for p in str(cpuset or "").split(",") if p.strip()]
 
 
-def choose_balanced_from_cpulist(cpulist: str, count: int, exclude: List[int] = None) -> List[int]:
+def choose_balanced_from_cpulist(cpulist: str, count: int, exclude: Optional[List[int]] = None) -> List[int]:
     if count <= 0:
         return []
     exclude_set = set(exclude or [])
@@ -69,25 +77,21 @@ def choose_balanced_from_cpulist(cpulist: str, count: int, exclude: List[int] = 
     return sorted(out)
 
 
-def choose_balanced_across_numa(numa_nodes: List[Dict], total_count: int, exclude: List[int] = None) -> List[int]:
+def choose_balanced_across_numa(numa_nodes: List[Dict], total_count: int, exclude: Optional[List[int]] = None) -> List[int]:
     if total_count <= 0 or not numa_nodes:
         return []
     exclude_set = set(exclude or [])
-    per = total_count // len(numa_nodes)
-    rem = total_count % len(numa_nodes)
+    sorted_numa = sorted(numa_nodes, key=lambda x: x.get("id", 0))
+    per = total_count // len(sorted_numa)
+    rem = total_count % len(sorted_numa)
     out = []
-    for idx, numa in enumerate(sorted(numa_nodes, key=lambda x: x.get("id", 0))):
+    for idx, numa in enumerate(sorted_numa):
         take = per + (1 if idx < rem else 0)
         out.extend(choose_balanced_from_cpulist(numa.get("cpus", ""), take, list(exclude_set | set(out))))
     return sorted(out)
 
 
-def allocate_same_numa_first(numa_nodes: List[Dict], exclude: List[int] = None) -> Dict[str, Any]:
-    """
-    For gpu-only and cpu-only groups: expose NUMA-local pools and first-preferred
-    NUMA node. This is a recommendation for workload placement. It does not
-    configure kubelet yet.
-    """
+def allocate_same_numa_first(numa_nodes: List[Dict], exclude: Optional[List[int]] = None) -> Dict[str, Any]:
     exclude_set = set(exclude or [])
     numa_pools = {}
     for numa in sorted(numa_nodes, key=lambda x: x.get("id", 0)):
@@ -132,6 +136,18 @@ def upsert_configmap(namespace: str, name: str, data: Dict[str, str]):
 
 def patch_node_labels(node_name: str, labels: Dict[str, str]):
     client.CoreV1Api().patch_node(node_name, {"metadata": {"labels": labels}})
+
+
+def upsert_cluster_custom_object(group: str, version: str, plural: str, name: str, body: Dict):
+    api = client.CustomObjectsApi()
+    try:
+        api.get_cluster_custom_object(group, version, plural, name)
+        api.patch_cluster_custom_object(group, version, plural, name, body)
+    except ApiException as e:
+        if e.status == 404:
+            api.create_cluster_custom_object(group, version, plural, body)
+        else:
+            raise
 
 
 def get_nested(d: Dict, path: List[str], default=None):
@@ -247,8 +263,6 @@ def profile_for_class(spec: Dict, node_class: str) -> Dict:
                 "cpuPodPool": "all-remaining-balanced-across-numa",
             },
             "cpuManagerPolicy": "static",
-            # distribute-cpus-across-numa is a CPU Manager static policy option,
-            # not a Topology Manager policy.
             "cpuManagerPolicyOptions": {
                 "distribute-cpus-across-numa": "true",
                 "full-pcpus-only": "true",
@@ -262,7 +276,6 @@ def profile_for_class(spec: Dict, node_class: str) -> Dict:
                 "cpuPodPool": "all-remaining-balanced-across-numa",
             },
             "cpuManagerPolicy": "static",
-            # AMX CPU inference wants a balanced spread across NUMA nodes.
             "cpuManagerPolicyOptions": {
                 "distribute-cpus-across-numa": "true",
                 "full-pcpus-only": "true",
@@ -314,8 +327,10 @@ def compute_placement_for_node(topo_status: Dict, node_class: str, profile: Dict
             "gpuPodDistribution": "balanced-across-numa",
             "cpuPodCPUSet": compress_cpuset(cpu_pod_cpus),
             "cpuPodDistribution": "remaining-balanced-across-numa",
+            # Do not use reservedSystemCPUs for GPU pod CPUs. That would remove
+            # those CPUs from the exclusive allocation pool for all pods.
             "systemReservedCPUSet": "",
-            "note": "Computed recommendation only; Phase 4 worker-node kubelet enforcement is not implemented.",
+            "note": "CPU Manager can enforce static CPU policy and balanced allocation. It does not create separate GPU-vs-CPU pod pools by itself.",
         }
 
     if node_class == "cpu-amx":
@@ -333,27 +348,23 @@ def compute_placement_for_node(topo_status: Dict, node_class: str, profile: Dict
             "reservedOtherPodsPerNuma": per_numa,
             "cpuPodCPUSet": compress_cpuset(cpu_pod_cpus),
             "cpuPodDistribution": "remaining-balanced-across-numa",
-            "note": "Computed recommendation only; Phase 4 worker-node kubelet enforcement is not implemented.",
+            "systemReservedCPUSet": compress_cpuset(other_reserved),
+            "note": "reservedSystemCPUs maps to the other-pods reserved CPU set for this group.",
         }
 
-    # cpu-only and gpu-only: same NUMA node first.
     local = allocate_same_numa_first(numa_nodes)
     return {
         "strategy": "same-numa-node-first",
         "topologyManagerPolicy": profile.get("topologyManagerPolicy", "single-numa-node"),
         "cpuManagerPolicy": profile.get("cpuManagerPolicy", "static"),
+        "cpuManagerPolicyOptions": profile.get("cpuManagerPolicyOptions", {}),
         **local,
-        "note": "Computed recommendation only; Phase 4 worker-node kubelet enforcement is not implemented.",
+        "systemReservedCPUSet": "",
+        "note": "CPU Manager static plus Topology Manager single-numa-node is the Phase 4 target for same-NUMA-first groups.",
     }
 
 
 def legacy_reserved_cpuset_from_placement(node_class: str, placement: Dict[str, Any]) -> str:
-    """
-    Backward-compatible summary key:
-    - mixed: GPU pod reserved CPUs
-    - cpu-amx: other-pod reserved CPUs
-    - cpu/gpu-only: preferred NUMA pool
-    """
     if node_class == "mixed-cpu-amx-gpu":
         return placement.get("gpuPodCPUSet", "")
     if node_class == "cpu-amx":
@@ -361,6 +372,19 @@ def legacy_reserved_cpuset_from_placement(node_class: str, placement: Dict[str, 
     pools = placement.get("numaLocalCPUSetByNuma") or {}
     preferred = placement.get("preferredNumaNode", "")
     return pools.get(str(preferred), "")
+
+
+def phase4_reserved_system_cpus(node_class: str, placement: Dict[str, Any]) -> str:
+    """
+    CPU Manager's reservedSystemCPUs means CPUs reserved for OS/system/shared
+    work and removed from the exclusive allocation pool.
+
+    Do not set reservedSystemCPUs to the GPU pod CPU set. GPU pods need those
+    CPUs to remain allocatable.
+    """
+    if node_class == "cpu-amx":
+        return placement.get("otherPodsReservedCPUSet", "")
+    return placement.get("systemReservedCPUSet", "")
 
 
 def topology_signature(topo_status: Dict, node_class: str, profile: Dict) -> str:
@@ -374,10 +398,121 @@ def topology_signature(topo_status: Dict, node_class: str, profile: Dict) -> str
         f"strategy={placement.get('strategy')}",
         f"gpuPodReserved={placement.get('gpuPodReservedCPUs', '')}",
         f"otherPerNuma={placement.get('reservedOtherPodsPerNuma', '')}",
+        f"cpuManagerOptions={profile.get('cpuManagerPolicyOptions', {})}",
     ])
 
 
-def build_node_labels(node_class: str, gpu_count: int, topo_status: Dict, group_name: str, placement: Dict[str, Any], labels_spec: Dict) -> Dict[str, str]:
+def dns_safe_name(raw: str, max_len: int = 50) -> str:
+    name = re.sub(r"[^a-z0-9-]+", "-", raw.lower()).strip("-")
+    name = re.sub(r"-+", "-", name)
+    if len(name) > max_len:
+        name = name[:max_len].rstrip("-")
+    return name or "cpu-placement"
+
+
+def mcp_name_for_group(group_name: str, phase4: Dict) -> str:
+    prefix = phase4.get("machineConfigPoolNamePrefix", "cpu")
+    return dns_safe_name(f"{prefix}-{group_name}", 50)
+
+
+def pool_label_key(mcp_name: str) -> str:
+    return f"pools.operator.machineconfiguration.openshift.io/{mcp_name}"
+
+
+def build_machine_config_pool(group_name: str, group: Dict, phase4: Dict) -> Dict:
+    mcp_name = mcp_name_for_group(group_name, phase4)
+    return {
+        "apiVersion": f"{MCO_GROUP}/{MCO_VERSION}",
+        "kind": "MachineConfigPool",
+        "metadata": {
+            "name": mcp_name,
+            "labels": {
+                pool_label_key(mcp_name): "",
+                "cpu.example.com/topology-group": group_name,
+                "cpu.example.com/node-class": group.get("nodeClass", ""),
+            },
+        },
+        "spec": {
+            "machineConfigSelector": {
+                "matchExpressions": [
+                    {
+                        "key": "machineconfiguration.openshift.io/role",
+                        "operator": "In",
+                        "values": ["worker", mcp_name],
+                    }
+                ]
+            },
+            "nodeSelector": {
+                "matchLabels": {
+                    "cpu.example.com/topology-group": group_name,
+                }
+            },
+            "paused": bool(phase4.get("pauseMachineConfigPool", False)),
+        },
+    }
+
+
+def build_kubelet_config(group_name: str, group: Dict, phase4: Dict) -> Dict:
+    mcp_name = mcp_name_for_group(group_name, phase4)
+    kc_name = dns_safe_name(f"kubelet-{mcp_name}", 63)
+
+    # Only include reservedSystemCPUs when every node in the group has the same value.
+    # KubeletConfig applies to the whole MCP, not one node at a time.
+    reserved_values = sorted({
+        (p.get("systemReservedCPUSet") or "")
+        for p in (group.get("placementByNode") or {}).values()
+        if p.get("systemReservedCPUSet")
+    })
+    kubelet_config = {
+        "cpuManagerPolicy": group.get("cpuManagerPolicy", "static"),
+        "cpuManagerPolicyOptions": group.get("cpuManagerPolicyOptions", {}),
+        "topologyManagerPolicy": group.get("topologyManagerPolicy", "restricted"),
+        "topologyManagerScope": phase4.get("topologyManagerScope", "pod"),
+    }
+    if len(reserved_values) == 1:
+        kubelet_config["reservedSystemCPUs"] = reserved_values[0]
+    elif len(reserved_values) > 1:
+        kubelet_config["reservedSystemCPUsComment"] = "Not set because nodes in this MCP group have different reservedSystemCPUs values."
+
+    return {
+        "apiVersion": f"{MCO_GROUP}/{MCO_VERSION}",
+        "kind": "KubeletConfig",
+        "metadata": {
+            "name": kc_name,
+            "labels": {
+                "cpu.example.com/topology-group": group_name,
+                "cpu.example.com/node-class": group.get("nodeClass", ""),
+            },
+        },
+        "spec": {
+            "machineConfigPoolSelector": {
+                "matchLabels": {
+                    pool_label_key(mcp_name): "",
+                }
+            },
+            "kubeletConfig": kubelet_config,
+        },
+    }
+
+
+def build_phase4_manifests(topology_groups: Dict[str, Dict], phase4: Dict) -> Dict[str, Dict[str, Dict]]:
+    manifests = {"machineConfigPools": {}, "kubeletConfigs": {}}
+    for group_name, group in sorted(topology_groups.items()):
+        mcp = build_machine_config_pool(group_name, group, phase4)
+        kc = build_kubelet_config(group_name, group, phase4)
+        manifests["machineConfigPools"][mcp["metadata"]["name"]] = mcp
+        manifests["kubeletConfigs"][kc["metadata"]["name"]] = kc
+    return manifests
+
+
+def apply_phase4_manifests(manifests: Dict[str, Dict[str, Dict]]):
+    for name, body in manifests.get("machineConfigPools", {}).items():
+        upsert_cluster_custom_object(MCO_GROUP, MCO_VERSION, MCP_PLURAL, name, body)
+    for name, body in manifests.get("kubeletConfigs", {}).items():
+        upsert_cluster_custom_object(MCO_GROUP, MCO_VERSION, KUBELETCONFIG_PLURAL, name, body)
+
+
+def build_node_labels(node_class: str, gpu_count: int, topo_status: Dict, group_name: str, placement: Dict[str, Any], labels_spec: Dict, phase4_applied: bool) -> Dict[str, str]:
     prefix = labels_spec.get("prefix", "cpu.example.com")
     amx = amx_detail(topo_status)
     return {
@@ -391,14 +526,20 @@ def build_node_labels(node_class: str, gpu_count: int, topo_status: Dict, group_
         f"{prefix}/amx-bf16": str(amx["amx_bf16"]).lower(),
         f"{prefix}/amx-int8": str(amx["amx_int8"]).lower(),
         f"{prefix}/placement-ready": "true",
-        f"{prefix}/phase4-applied": "false",
+        f"{prefix}/phase4-applied": str(phase4_applied).lower(),
     }
 
 
-def render_kubelet_config_by_group(groups: Dict[str, Dict]) -> str:
+def render_kubelet_config_by_group(groups: Dict[str, Dict], phase4: Dict) -> str:
+    manifests = build_phase4_manifests(groups, phase4)
     return yaml.safe_dump({
-        "note": "Example only. Phase 4 worker-node KubeletConfig/MachineConfig enforcement is not implemented. distribute-cpus-across-numa is a CPU Manager policy option, not a Topology Manager policy.",
-        "groups": groups,
+        "note": (
+            "Example only unless spec.phase4.apply=true. "
+            "KubeletConfig applies to a MachineConfigPool and may trigger MCO rollout/reboot. "
+            "distribute-cpus-across-numa is a CPU Manager policy option."
+        ),
+        "phase4": phase4,
+        "manifests": manifests,
     }, sort_keys=False)
 
 
@@ -412,7 +553,9 @@ def configure(settings: kopf.OperatorSettings, **_):
 def reconcile_cpu_placement_policy(spec, name, namespace, logger, **_):
     target_selector = spec.get("targetNodeSelector") or spec.get("nodeSelector") or {"node-role.kubernetes.io/worker": ""}
     labels_spec = spec.get("nodeLabels", {}) or {}
-    enable_labels = bool(labels_spec.get("enabled", spec.get("enableNodeLabels", True)))
+    phase4 = spec.get("phase4", {}) or {}
+    phase4_enabled = bool(phase4.get("enabled", False))
+    phase4_apply = bool(phase4.get("apply", False))
 
     topologies = list_node_topologies(namespace)
     nodes = list_nodes()
@@ -467,24 +610,52 @@ def reconcile_cpu_placement_policy(spec, name, namespace, logger, **_):
         topology_groups[group_name]["nodes"].append(node_name)
         topology_groups[group_name]["placementByNode"][node_name] = placement
 
-        generated_labels = build_node_labels(node_class, gpu_count, topo_status, group_name, placement, labels_spec)
+    phase4_manifests = build_phase4_manifests(topology_groups, phase4) if phase4_enabled else {"machineConfigPools": {}, "kubeletConfigs": {}}
+    phase4_status = "disabled"
+    phase4_error = ""
+
+    if phase4_enabled and phase4_apply:
+        try:
+            apply_phase4_manifests(phase4_manifests)
+            phase4_status = "applied"
+        except Exception as exc:
+            phase4_status = "apply-failed"
+            phase4_error = str(exc)
+            logger.exception("Failed to apply Phase 4 manifests")
+    elif phase4_enabled:
+        phase4_status = "generated-only"
+
+    enable_labels = bool(labels_spec.get("enabled", spec.get("enableNodeLabels", True)))
+    for node_name, entry in node_classes.items():
+        generated_labels = build_node_labels(
+            entry["class"],
+            entry["gpuCount"],
+            next(t.get("status", {}) for t in topologies if (t.get("status", {}).get("nodeName") or t.get("spec", {}).get("nodeName")) == node_name),
+            entry["topologyGroup"],
+            entry["placement"],
+            labels_spec,
+            phase4_status == "applied",
+        )
         labels_by_node[node_name] = generated_labels
         if enable_labels:
             patch_node_labels(node_name, generated_labels)
 
     data = {
         "policyName": name,
-        "phase4Status": "not-implemented",
+        "phase4Status": phase4_status,
+        "phase4Error": phase4_error,
         "targetNodeSelector.yaml": yaml.safe_dump(target_selector, sort_keys=True),
         "nodeClassification.yaml": yaml.safe_dump(node_classes, sort_keys=True),
         "topologyGroups.yaml": yaml.safe_dump(topology_groups, sort_keys=True),
         "cpuPlacementByNode.yaml": yaml.safe_dump(placement_by_node, sort_keys=True),
         "reservedSystemCPUsByNode.yaml": yaml.safe_dump(legacy_reserved, sort_keys=True),
         "generatedNodeLabels.yaml": yaml.safe_dump(labels_by_node, sort_keys=True),
-        "kubeletConfigByTopologyClass.yaml": render_kubelet_config_by_group(topology_groups),
+        "phase4MachineConfigPools.yaml": yaml.safe_dump(phase4_manifests.get("machineConfigPools", {}), sort_keys=True),
+        "phase4KubeletConfigs.yaml": yaml.safe_dump(phase4_manifests.get("kubeletConfigs", {}), sort_keys=True),
+        "kubeletConfigByTopologyClass.yaml": render_kubelet_config_by_group(topology_groups, phase4),
     }
     upsert_configmap(namespace, f"{name}-computed-cpu-policy", data)
-    logger.info("Reconciled CPUPlacementPolicy %s; nodes=%d groups=%d labels=%s", name, len(placement_by_node), len(topology_groups), enable_labels)
+    logger.info("Reconciled CPUPlacementPolicy %s; nodes=%d groups=%d phase4=%s", name, len(placement_by_node), len(topology_groups), phase4_status)
 
 
 @kopf.on.create(GROUP, VERSION, "nodecputopologies")
