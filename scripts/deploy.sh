@@ -7,4 +7,4 @@ oc adm policy add-scc-to-user privileged -z node-topology-agent -n cpu-operator-
 oc apply -f agent/daemonset.yaml
 oc apply -f operator/deployment.yaml
 oc apply -f examples/cpu-placement-policy.yaml
-echo "Run ./scripts/sanity-check.sh to validate the deployment."
+./scripts/sanity-check.sh

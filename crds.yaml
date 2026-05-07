@@ -53,26 +53,4 @@ spec:
           properties:
             spec:
               type: object
-              properties:
-                nodeSelector:
-                  type: object
-                  additionalProperties:
-                    type: string
-                systemReserved:
-                  type: object
-                  properties:
-                    logicalCPUsPerNuma:
-                      type: integer
-                      minimum: 0
-                topologyManagerPolicy:
-                  type: string
-                  enum:
-                    - none
-                    - best-effort
-                    - restricted
-                    - single-numa-node
-                cpuManagerPolicy:
-                  type: string
-                  enum:
-                    - none
-                    - static
+              x-kubernetes-preserve-unknown-fields: true

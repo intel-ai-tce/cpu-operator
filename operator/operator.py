@@ -1,137 +1,125 @@
 #!/usr/bin/env python3
 
-from typing import Dict, List
-
+from typing import Dict, List, Any, Tuple
 import kopf
 import yaml
 from kubernetes import client, config
 from kubernetes.client.rest import ApiException
 
-
 GROUP = "cpu.example.com"
 VERSION = "v1alpha1"
 TOPOLOGY_PLURAL = "nodecputopologies"
+VALID_CLASSES = {"mixed-cpu-amx-gpu", "cpu-amx", "cpu-only", "gpu-only"}
 
 
 def expand_cpuset(cpuset: str) -> List[int]:
-    cpus: List[int] = []
-    if not cpuset:
-        return cpus
-
-    for part in cpuset.split(","):
+    out: List[int] = []
+    for part in str(cpuset or "").split(","):
         part = part.strip()
         if not part:
             continue
-
         if "-" in part:
-            start, end = part.split("-", 1)
-            cpus.extend(range(int(start), int(end) + 1))
+            a, b = part.split("-", 1)
+            out.extend(range(int(a), int(b) + 1))
         else:
-            cpus.append(int(part))
-
-    return sorted(set(cpus))
+            out.append(int(part))
+    return sorted(set(out))
 
 
 def compress_cpuset(cpus: List[int]) -> str:
+    cpus = sorted(set(cpus))
     if not cpus:
         return ""
-
-    cpus = sorted(set(cpus))
     ranges = []
     start = prev = cpus[0]
-
     for cpu in cpus[1:]:
         if cpu == prev + 1:
             prev = cpu
-            continue
-        ranges.append((start, prev))
-        start = prev = cpu
-
+        else:
+            ranges.append((start, prev))
+            start = prev = cpu
     ranges.append((start, prev))
+    return ",".join(str(s) if s == e else f"{s}-{e}" for s, e in ranges)
 
-    output = []
-    for start, end in ranges:
-        output.append(str(start) if start == end else f"{start}-{end}")
 
-    return ",".join(output)
+def subtract_cpuset(all_cpus: List[int], remove: List[int]) -> List[int]:
+    r = set(remove)
+    return [c for c in sorted(set(all_cpus)) if c not in r]
 
 
 def split_cpuset_groups(cpuset: str) -> List[List[int]]:
-    groups = []
-    for part in cpuset.split(","):
-        part = part.strip()
-        if part:
-            groups.append(expand_cpuset(part))
-    return groups
+    return [expand_cpuset(p.strip()) for p in str(cpuset or "").split(",") if p.strip()]
 
 
-def choose_balanced_reserved(cpulist: str, count: int) -> List[int]:
-    """
-    Choose count logical CPUs from a NUMA cpulist.
-
-    For SMT-style cpulists such as '0-42,172-214', this spreads
-    the reservation across the two ranges:
-      count=40 -> 0-19,172-191
-    """
+def choose_balanced_from_cpulist(cpulist: str, count: int, exclude: List[int] = None) -> List[int]:
     if count <= 0:
         return []
-
-    groups = split_cpuset_groups(cpulist)
+    exclude_set = set(exclude or [])
+    groups = [[c for c in g if c not in exclude_set] for g in split_cpuset_groups(cpulist)]
+    groups = [g for g in groups if g]
     if not groups:
         return []
-
     if len(groups) == 1:
         return groups[0][:count]
-
-    per_group = count // len(groups)
-    remainder = count % len(groups)
-
-    reserved = []
+    per = count // len(groups)
+    rem = count % len(groups)
+    out = []
     for idx, group in enumerate(groups):
-        take = per_group + (1 if idx < remainder else 0)
-        reserved.extend(group[:take])
-
-    return sorted(reserved)
+        out.extend(group[: per + (1 if idx < rem else 0)])
+    return sorted(out)
 
 
-def compute_reserved_system_cpus(topologies: List[Dict], logical_cpus_per_numa: int) -> Dict[str, str]:
-    result = {}
+def choose_balanced_across_numa(numa_nodes: List[Dict], total_count: int, exclude: List[int] = None) -> List[int]:
+    if total_count <= 0 or not numa_nodes:
+        return []
+    exclude_set = set(exclude or [])
+    per = total_count // len(numa_nodes)
+    rem = total_count % len(numa_nodes)
+    out = []
+    for idx, numa in enumerate(sorted(numa_nodes, key=lambda x: x.get("id", 0))):
+        take = per + (1 if idx < rem else 0)
+        out.extend(choose_balanced_from_cpulist(numa.get("cpus", ""), take, list(exclude_set | set(out))))
+    return sorted(out)
 
-    for topo in topologies:
-        status = topo.get("status", {})
-        node_name = status.get("nodeName") or topo.get("spec", {}).get("nodeName")
-        numa_nodes = status.get("numaNodes", [])
 
-        if not node_name or not numa_nodes:
-            continue
+def allocate_same_numa_first(numa_nodes: List[Dict], exclude: List[int] = None) -> Dict[str, Any]:
+    """
+    For gpu-only and cpu-only groups: expose NUMA-local pools and first-preferred
+    NUMA node. This is a recommendation for workload placement. It does not
+    configure kubelet yet.
+    """
+    exclude_set = set(exclude or [])
+    numa_pools = {}
+    for numa in sorted(numa_nodes, key=lambda x: x.get("id", 0)):
+        cpus = [c for c in expand_cpuset(numa.get("cpus", "")) if c not in exclude_set]
+        numa_pools[str(numa.get("id"))] = compress_cpuset(cpus)
+    preferred = next((k for k, v in numa_pools.items() if v), "")
+    return {
+        "strategy": "same-numa-node-first",
+        "preferredNumaNode": preferred,
+        "numaLocalCPUSetByNuma": numa_pools,
+    }
 
-        reserved = []
-        for numa in sorted(numa_nodes, key=lambda x: x.get("id", 0)):
-            reserved.extend(choose_balanced_reserved(numa.get("cpus", ""), logical_cpus_per_numa))
 
-        result[node_name] = compress_cpuset(reserved)
-
-    return result
+def all_numa_cpus(numa_nodes: List[Dict]) -> List[int]:
+    out = []
+    for n in numa_nodes:
+        out.extend(expand_cpuset(n.get("cpus", "")))
+    return sorted(set(out))
 
 
 def list_node_topologies(namespace: str) -> List[Dict]:
     api = client.CustomObjectsApi()
-    response = api.list_namespaced_custom_object(
-        GROUP,
-        VERSION,
-        namespace,
-        TOPOLOGY_PLURAL,
-    )
-    return response.get("items", [])
+    return api.list_namespaced_custom_object(GROUP, VERSION, namespace, TOPOLOGY_PLURAL).get("items", [])
+
+
+def list_nodes() -> Dict[str, Dict]:
+    return {n.metadata.name: n.to_dict() for n in client.CoreV1Api().list_node().items}
 
 
 def upsert_configmap(namespace: str, name: str, data: Dict[str, str]):
     core = client.CoreV1Api()
-    body = client.V1ConfigMap(
-        metadata=client.V1ObjectMeta(name=name, namespace=namespace),
-        data=data,
-    )
-
+    body = client.V1ConfigMap(metadata=client.V1ObjectMeta(name=name, namespace=namespace), data=data)
     try:
         core.read_namespaced_config_map(name=name, namespace=namespace)
         core.patch_namespaced_config_map(name=name, namespace=namespace, body=body)
@@ -142,65 +130,364 @@ def upsert_configmap(namespace: str, name: str, data: Dict[str, str]):
             raise
 
 
-def render_kubelet_config_example(
-    node_reserved: Dict[str, str],
-    cpu_manager_policy: str,
-    topology_manager_policy: str,
-) -> str:
-    rendered = {
-        "note": "Example only. Validate before applying to real OpenShift KubeletConfig.",
-        "cpuManagerPolicy": cpu_manager_policy,
-        "topologyManagerPolicy": topology_manager_policy,
-        "perNodeReservedSystemCPUs": node_reserved,
+def patch_node_labels(node_name: str, labels: Dict[str, str]):
+    client.CoreV1Api().patch_node(node_name, {"metadata": {"labels": labels}})
+
+
+def get_nested(d: Dict, path: List[str], default=None):
+    cur = d
+    for p in path:
+        if not isinstance(cur, dict):
+            return default
+        cur = cur.get(p)
+    return cur if cur is not None else default
+
+
+def match_selector(labels: Dict[str, str], selector: Dict[str, str]) -> bool:
+    if not selector:
+        return True
+    for key, expected in selector.items():
+        if key not in labels:
+            return False
+        if expected not in ("", None) and str(labels.get(key)) != str(expected):
+            return False
+    return True
+
+
+def get_gpu_count_from_node(node: Dict) -> int:
+    alloc = get_nested(node, ["status", "allocatable"], {}) or {}
+    gpu = alloc.get("nvidia.com/gpu")
+    if gpu is not None:
+        try:
+            return int(gpu)
+        except (TypeError, ValueError):
+            return 0
+    labels = get_nested(node, ["metadata", "labels"], {}) or {}
+    if labels.get("nvidia.com/gpu.present") == "true" or labels.get("feature.node.kubernetes.io/pci-10de.present") == "true":
+        return 1
+    count = labels.get("nvidia.com/gpu.count")
+    if count:
+        try:
+            return int(count)
+        except ValueError:
+            return 1
+    return 0
+
+
+def get_gpu_count(node: Dict, topo_status: Dict) -> int:
+    return max(get_gpu_count_from_node(node), int(topo_status.get("gpuCountFromPCI") or 0), len(topo_status.get("gpus") or []))
+
+
+def amx_supported(topo_status: Dict) -> bool:
+    amx = topo_status.get("amx") or {}
+    return bool(amx.get("amx_bf16")) and bool(amx.get("amx_int8"))
+
+
+def amx_detail(topo_status: Dict) -> Dict[str, Any]:
+    amx = topo_status.get("amx") or {}
+    return {
+        "amx_bf16": bool(amx.get("amx_bf16")),
+        "amx_int8": bool(amx.get("amx_int8")),
+        "amx_tile": bool(amx.get("amx_tile")),
+        "amx_fp16": bool(amx.get("amx_fp16")),
+        "amx_supported": amx_supported(topo_status),
+        "flags": amx.get("flags") or [],
     }
-    return yaml.safe_dump(rendered, sort_keys=False)
+
+
+def total_logical_cpus(numa_nodes: List[Dict]) -> int:
+    return len(all_numa_cpus(numa_nodes))
+
+
+def classify_node(node: Dict, topo_status: Dict, spec: Dict) -> Tuple[str, Dict[str, Any]]:
+    labels = get_nested(node, ["metadata", "labels"], {}) or {}
+    classification = spec.get("classification", {}) or {}
+    override_key = classification.get("overrideLabel", "cpu.example.com/node-class")
+    override = labels.get(override_key)
+
+    gpu_count = get_gpu_count(node, topo_status)
+    cpu_count = total_logical_cpus(topo_status.get("numaNodes") or [])
+    has_amx = amx_supported(topo_status)
+
+    if override in VALID_CLASSES:
+        if override in ("cpu-amx", "mixed-cpu-amx-gpu") and not has_amx:
+            return ("gpu-only" if gpu_count else "cpu-only"), {
+                "reason": f"override {override_key}={override} requested AMX class but amx_bf16/amx_int8 missing",
+                "requestedOverride": override,
+                "gpuCount": gpu_count,
+                "logicalCPUs": cpu_count,
+                "amx": amx_detail(topo_status),
+            }
+        return override, {"reason": f"override label {override_key}={override}", "gpuCount": gpu_count, "logicalCPUs": cpu_count, "amx": amx_detail(topo_status)}
+
+    gpu_only_selector = classification.get("gpuOnlyNodeSelector", {}) or {}
+    amx_selector = classification.get("amxNodeSelector", {}) or {}
+    cpu_amx_min = int(classification.get("cpuAmxMinLogicalCPUs", 64))
+
+    if gpu_count > 0 and match_selector(labels, gpu_only_selector) and gpu_only_selector:
+        return "gpu-only", {"reason": "matched gpuOnlyNodeSelector", "gpuCount": gpu_count, "logicalCPUs": cpu_count, "amx": amx_detail(topo_status)}
+    if gpu_count > 0 and has_amx:
+        return "mixed-cpu-amx-gpu", {"reason": "GPU detected and amx_bf16/amx_int8 supported", "gpuCount": gpu_count, "logicalCPUs": cpu_count, "amx": amx_detail(topo_status)}
+    if gpu_count > 0:
+        return "gpu-only", {"reason": "GPU detected but amx_bf16/amx_int8 missing", "gpuCount": gpu_count, "logicalCPUs": cpu_count, "amx": amx_detail(topo_status)}
+    if has_amx and match_selector(labels, amx_selector) and amx_selector:
+        return "cpu-amx", {"reason": "matched amxNodeSelector and amx_bf16/amx_int8 supported", "gpuCount": gpu_count, "logicalCPUs": cpu_count, "amx": amx_detail(topo_status)}
+    if has_amx and cpu_count >= cpu_amx_min:
+        return "cpu-amx", {"reason": f"amx_bf16/amx_int8 supported and logical CPU count >= {cpu_amx_min}", "gpuCount": gpu_count, "logicalCPUs": cpu_count, "amx": amx_detail(topo_status)}
+    return "cpu-only", {"reason": "default non-GPU/non-AMX worker", "gpuCount": gpu_count, "logicalCPUs": cpu_count, "amx": amx_detail(topo_status)}
+
+
+def profile_for_class(spec: Dict, node_class: str) -> Dict:
+    defaults = {
+        "mixed-cpu-amx-gpu": {
+            "placement": {
+                "strategy": "balanced-shared-cpu-and-gpu",
+                "gpuPodReservedCPUs": 12,
+                "gpuPodDistribution": "balanced-across-numa",
+                "cpuPodPool": "all-remaining-balanced-across-numa",
+            },
+            "cpuManagerPolicy": "static",
+            # distribute-cpus-across-numa is a CPU Manager static policy option,
+            # not a Topology Manager policy.
+            "cpuManagerPolicyOptions": {
+                "distribute-cpus-across-numa": "true",
+                "full-pcpus-only": "true",
+            },
+            "topologyManagerPolicy": "restricted",
+        },
+        "cpu-amx": {
+            "placement": {
+                "strategy": "balanced-reserved-other-pods",
+                "reservedOtherPodsPerNuma": 2,
+                "cpuPodPool": "all-remaining-balanced-across-numa",
+            },
+            "cpuManagerPolicy": "static",
+            # AMX CPU inference wants a balanced spread across NUMA nodes.
+            "cpuManagerPolicyOptions": {
+                "distribute-cpus-across-numa": "true",
+                "full-pcpus-only": "true",
+            },
+            "topologyManagerPolicy": "restricted",
+        },
+        "cpu-only": {
+            "placement": {"strategy": "same-numa-node-first"},
+            "cpuManagerPolicy": "static",
+            "cpuManagerPolicyOptions": {},
+            "topologyManagerPolicy": "single-numa-node",
+        },
+        "gpu-only": {
+            "placement": {"strategy": "same-numa-node-first"},
+            "cpuManagerPolicy": "static",
+            "cpuManagerPolicyOptions": {},
+            "topologyManagerPolicy": "single-numa-node",
+        },
+    }
+    user_profile = (spec.get("profiles", {}) or {}).get(node_class, {}) or {}
+    merged = {**defaults[node_class], **user_profile}
+    merged["placement"] = {**defaults[node_class].get("placement", {}), **user_profile.get("placement", {})}
+    merged["cpuManagerPolicyOptions"] = {
+        **defaults[node_class].get("cpuManagerPolicyOptions", {}),
+        **user_profile.get("cpuManagerPolicyOptions", {}),
+    }
+    return merged
+
+
+def compute_placement_for_node(topo_status: Dict, node_class: str, profile: Dict) -> Dict[str, Any]:
+    numa_nodes = sorted(topo_status.get("numaNodes") or [], key=lambda x: x.get("id", 0))
+    all_cpus = all_numa_cpus(numa_nodes)
+    placement = profile.get("placement", {}) or {}
+    strategy = placement.get("strategy", "")
+
+    if node_class == "mixed-cpu-amx-gpu":
+        gpu_count = int(topo_status.get("gpuCountFromPCI") or len(topo_status.get("gpus") or []) or 1)
+        gpu_reserved = int(placement.get("gpuPodReservedCPUs", 12))
+        gpu_pod_cpus = choose_balanced_across_numa(numa_nodes, gpu_reserved)
+        cpu_pod_cpus = subtract_cpuset(all_cpus, gpu_pod_cpus)
+        return {
+            "strategy": strategy,
+            "topologyManagerPolicy": profile.get("topologyManagerPolicy", "restricted"),
+            "cpuManagerPolicy": profile.get("cpuManagerPolicy", "static"),
+            "cpuManagerPolicyOptions": profile.get("cpuManagerPolicyOptions", {}),
+            "gpuCount": gpu_count,
+            "gpuPodCPUSet": compress_cpuset(gpu_pod_cpus),
+            "gpuPodReservedCPUs": len(gpu_pod_cpus),
+            "gpuPodDistribution": "balanced-across-numa",
+            "cpuPodCPUSet": compress_cpuset(cpu_pod_cpus),
+            "cpuPodDistribution": "remaining-balanced-across-numa",
+            "systemReservedCPUSet": "",
+            "note": "Computed recommendation only; Phase 4 worker-node kubelet enforcement is not implemented.",
+        }
+
+    if node_class == "cpu-amx":
+        per_numa = int(placement.get("reservedOtherPodsPerNuma", 2))
+        other_reserved = []
+        for numa in numa_nodes:
+            other_reserved.extend(choose_balanced_from_cpulist(numa.get("cpus", ""), per_numa))
+        cpu_pod_cpus = subtract_cpuset(all_cpus, other_reserved)
+        return {
+            "strategy": strategy,
+            "topologyManagerPolicy": profile.get("topologyManagerPolicy", "restricted"),
+            "cpuManagerPolicy": profile.get("cpuManagerPolicy", "static"),
+            "cpuManagerPolicyOptions": profile.get("cpuManagerPolicyOptions", {}),
+            "otherPodsReservedCPUSet": compress_cpuset(other_reserved),
+            "reservedOtherPodsPerNuma": per_numa,
+            "cpuPodCPUSet": compress_cpuset(cpu_pod_cpus),
+            "cpuPodDistribution": "remaining-balanced-across-numa",
+            "note": "Computed recommendation only; Phase 4 worker-node kubelet enforcement is not implemented.",
+        }
+
+    # cpu-only and gpu-only: same NUMA node first.
+    local = allocate_same_numa_first(numa_nodes)
+    return {
+        "strategy": "same-numa-node-first",
+        "topologyManagerPolicy": profile.get("topologyManagerPolicy", "single-numa-node"),
+        "cpuManagerPolicy": profile.get("cpuManagerPolicy", "static"),
+        **local,
+        "note": "Computed recommendation only; Phase 4 worker-node kubelet enforcement is not implemented.",
+    }
+
+
+def legacy_reserved_cpuset_from_placement(node_class: str, placement: Dict[str, Any]) -> str:
+    """
+    Backward-compatible summary key:
+    - mixed: GPU pod reserved CPUs
+    - cpu-amx: other-pod reserved CPUs
+    - cpu/gpu-only: preferred NUMA pool
+    """
+    if node_class == "mixed-cpu-amx-gpu":
+        return placement.get("gpuPodCPUSet", "")
+    if node_class == "cpu-amx":
+        return placement.get("otherPodsReservedCPUSet", "")
+    pools = placement.get("numaLocalCPUSetByNuma") or {}
+    preferred = placement.get("preferredNumaNode", "")
+    return pools.get(str(preferred), "")
+
+
+def topology_signature(topo_status: Dict, node_class: str, profile: Dict) -> str:
+    numa_shapes = [f"{n.get('id')}:{len(expand_cpuset(n.get('cpus', '')))}" for n in sorted(topo_status.get("numaNodes") or [], key=lambda x: x.get("id", 0))]
+    placement = profile.get("placement", {}) or {}
+    return "|".join([
+        f"class={node_class}",
+        f"numa={';'.join(numa_shapes)}",
+        f"gpuNuma={','.join(map(str, topo_status.get('gpuLocalNumaNodes') or []))}",
+        f"amx={amx_supported(topo_status)}",
+        f"strategy={placement.get('strategy')}",
+        f"gpuPodReserved={placement.get('gpuPodReservedCPUs', '')}",
+        f"otherPerNuma={placement.get('reservedOtherPodsPerNuma', '')}",
+    ])
+
+
+def build_node_labels(node_class: str, gpu_count: int, topo_status: Dict, group_name: str, placement: Dict[str, Any], labels_spec: Dict) -> Dict[str, str]:
+    prefix = labels_spec.get("prefix", "cpu.example.com")
+    amx = amx_detail(topo_status)
+    return {
+        f"{prefix}/topology-ready": "true",
+        f"{prefix}/node-class": node_class,
+        f"{prefix}/topology-group": group_name,
+        f"{prefix}/placement-strategy": placement.get("strategy", "unknown")[:63],
+        f"{prefix}/gpu-count": str(gpu_count),
+        f"{prefix}/gpu-local-numa": ",".join(map(str, topo_status.get("gpuLocalNumaNodes") or [])) or "none",
+        f"{prefix}/amx-supported": str(amx["amx_supported"]).lower(),
+        f"{prefix}/amx-bf16": str(amx["amx_bf16"]).lower(),
+        f"{prefix}/amx-int8": str(amx["amx_int8"]).lower(),
+        f"{prefix}/placement-ready": "true",
+        f"{prefix}/phase4-applied": "false",
+    }
+
+
+def render_kubelet_config_by_group(groups: Dict[str, Dict]) -> str:
+    return yaml.safe_dump({
+        "note": "Example only. Phase 4 worker-node KubeletConfig/MachineConfig enforcement is not implemented. distribute-cpus-across-numa is a CPU Manager policy option, not a Topology Manager policy.",
+        "groups": groups,
+    }, sort_keys=False)
 
 
 @kopf.on.startup()
 def configure(settings: kopf.OperatorSettings, **_):
     config.load_incluster_config()
-    # Do not set settings.posting.level as a string.
-    # Kopf expects an integer logging level. Leaving default is safest for this PoC.
 
 
 @kopf.on.create(GROUP, VERSION, "cpuplacementpolicies")
 @kopf.on.update(GROUP, VERSION, "cpuplacementpolicies")
 def reconcile_cpu_placement_policy(spec, name, namespace, logger, **_):
-    logical_per_numa = spec.get("systemReserved", {}).get("logicalCPUsPerNuma", 0)
-    cpu_manager_policy = spec.get("cpuManagerPolicy", "static")
-    topology_manager_policy = spec.get("topologyManagerPolicy", "restricted")
+    target_selector = spec.get("targetNodeSelector") or spec.get("nodeSelector") or {"node-role.kubernetes.io/worker": ""}
+    labels_spec = spec.get("nodeLabels", {}) or {}
+    enable_labels = bool(labels_spec.get("enabled", spec.get("enableNodeLabels", True)))
 
     topologies = list_node_topologies(namespace)
-    node_reserved = compute_reserved_system_cpus(topologies, logical_per_numa)
+    nodes = list_nodes()
+
+    node_classes, placement_by_node, legacy_reserved, topology_groups, labels_by_node = {}, {}, {}, {}, {}
+
+    for topo in topologies:
+        topo_status = topo.get("status", {}) or {}
+        node_name = topo_status.get("nodeName") or topo.get("spec", {}).get("nodeName")
+        if not node_name:
+            continue
+        node = nodes.get(node_name)
+        if not node:
+            logger.warning("Skipping topology %s: node object not found", node_name)
+            continue
+        labels = get_nested(node, ["metadata", "labels"], {}) or {}
+        if not match_selector(labels, target_selector):
+            logger.info("Skipping node %s: does not match targetNodeSelector", node_name)
+            continue
+
+        node_class, reason = classify_node(node, topo_status, spec)
+        profile = profile_for_class(spec, node_class)
+        gpu_count = get_gpu_count(node, topo_status)
+        placement = compute_placement_for_node(topo_status, node_class, profile)
+        sig = topology_signature(topo_status, node_class, profile)
+        group_name = f"{node_class}-{abs(hash(sig)) % 100000:05d}"
+
+        placement_by_node[node_name] = placement
+        legacy_reserved[node_name] = legacy_reserved_cpuset_from_placement(node_class, placement)
+        node_classes[node_name] = {
+            "class": node_class,
+            "reason": reason,
+            "gpuCount": gpu_count,
+            "amx": amx_detail(topo_status),
+            "gpuLocalNumaNodes": topo_status.get("gpuLocalNumaNodes") or [],
+            "profile": profile,
+            "topologySignature": sig,
+            "topologyGroup": group_name,
+            "placement": placement,
+        }
+
+        topology_groups.setdefault(group_name, {
+            "nodeClass": node_class,
+            "topologySignature": sig,
+            "cpuManagerPolicy": profile.get("cpuManagerPolicy", "static"),
+            "cpuManagerPolicyOptions": profile.get("cpuManagerPolicyOptions", {}),
+            "topologyManagerPolicy": profile.get("topologyManagerPolicy", "restricted"),
+            "placementStrategy": placement.get("strategy"),
+            "nodes": [],
+            "placementByNode": {},
+        })
+        topology_groups[group_name]["nodes"].append(node_name)
+        topology_groups[group_name]["placementByNode"][node_name] = placement
+
+        generated_labels = build_node_labels(node_class, gpu_count, topo_status, group_name, placement, labels_spec)
+        labels_by_node[node_name] = generated_labels
+        if enable_labels:
+            patch_node_labels(node_name, generated_labels)
 
     data = {
         "policyName": name,
-        "logicalCPUsPerNuma": str(logical_per_numa),
-        "reservedSystemCPUsByNode.yaml": yaml.safe_dump(node_reserved, sort_keys=True),
-        "kubeletConfigExample.yaml": render_kubelet_config_example(
-            node_reserved=node_reserved,
-            cpu_manager_policy=cpu_manager_policy,
-            topology_manager_policy=topology_manager_policy,
-        ),
+        "phase4Status": "not-implemented",
+        "targetNodeSelector.yaml": yaml.safe_dump(target_selector, sort_keys=True),
+        "nodeClassification.yaml": yaml.safe_dump(node_classes, sort_keys=True),
+        "topologyGroups.yaml": yaml.safe_dump(topology_groups, sort_keys=True),
+        "cpuPlacementByNode.yaml": yaml.safe_dump(placement_by_node, sort_keys=True),
+        "reservedSystemCPUsByNode.yaml": yaml.safe_dump(legacy_reserved, sort_keys=True),
+        "generatedNodeLabels.yaml": yaml.safe_dump(labels_by_node, sort_keys=True),
+        "kubeletConfigByTopologyClass.yaml": render_kubelet_config_by_group(topology_groups),
     }
-
-    upsert_configmap(
-        namespace=namespace,
-        name=f"{name}-computed-cpu-policy",
-        data=data,
-    )
-
-    logger.info(
-        "Reconciled CPUPlacementPolicy %s; computed reserved CPUs for %d nodes",
-        name,
-        len(node_reserved),
-    )
+    upsert_configmap(namespace, f"{name}-computed-cpu-policy", data)
+    logger.info("Reconciled CPUPlacementPolicy %s; nodes=%d groups=%d labels=%s", name, len(placement_by_node), len(topology_groups), enable_labels)
 
 
 @kopf.on.create(GROUP, VERSION, "nodecputopologies")
 @kopf.on.update(GROUP, VERSION, "nodecputopologies")
 def on_node_topology_change(namespace, logger, **_):
-    logger.info(
-        "NodeCPUTopology changed in namespace %s. Re-apply or update CPUPlacementPolicy to recompute.",
-        namespace,
-    )
+    logger.info("NodeCPUTopology changed in namespace %s. Re-apply/update CPUPlacementPolicy to recompute immediately.", namespace)

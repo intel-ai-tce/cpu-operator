@@ -1,16 +1,78 @@
 apiVersion: cpu.example.com/v1alpha1
 kind: CPUPlacementPolicy
 metadata:
-  name: vllm-cpu-policy
+  name: auto-vllm-cpu-policy
   namespace: cpu-operator-system
 spec:
-  cpuManagerPolicy: static
-  topologyManagerPolicy: restricted
+  mode: Auto
 
-  # For a 4-NUMA-node system, 40 logical CPUs per NUMA creates
-  # a total reserved pool of 160 logical CPUs.
-  systemReserved:
-    logicalCPUsPerNuma: 40
-
-  nodeSelector:
+  targetNodeSelector:
     node-role.kubernetes.io/worker: ""
+
+  nodeLabels:
+    enabled: true
+    prefix: cpu.example.com
+
+  classification:
+    # Optional explicit override per node.
+    # Valid values:
+    #   mixed-cpu-amx-gpu
+    #   cpu-amx
+    #   cpu-only
+    #   gpu-only
+    #
+    # AMX classes require both amx_bf16 and amx_int8.
+    overrideLabel: cpu.example.com/node-class
+
+    amxNodeSelector:
+      node-role.kubernetes.io/inference: ""
+
+    gpuOnlyNodeSelector:
+      cpu.example.com/gpu-only: "true"
+
+    cpuAmxMinLogicalCPUs: 64
+
+  profiles:
+    mixed-cpu-amx-gpu:
+      cpuManagerPolicy: static
+      cpuManagerPolicyOptions:
+        distribute-cpus-across-numa: "true"
+        full-pcpus-only: "true"
+      topologyManagerPolicy: restricted
+      placement:
+        # Balanced CPU distribution among NUMA nodes for both CPU and GPU pods.
+        # Reserve 12 CPUs total for GPU pods, distributed across NUMA nodes.
+        # Give all remaining CPUs to CPU pods, still balanced across NUMA nodes.
+        strategy: balanced-shared-cpu-and-gpu
+        gpuPodReservedCPUs: 12
+        gpuPodDistribution: balanced-across-numa
+        cpuPodPool: all-remaining-balanced-across-numa
+
+    cpu-amx:
+      cpuManagerPolicy: static
+      cpuManagerPolicyOptions:
+        distribute-cpus-across-numa: "true"
+        full-pcpus-only: "true"
+      topologyManagerPolicy: restricted
+      placement:
+        # Reserve 2 CPUs per NUMA node for other pods.
+        # Give all remaining CPUs to CPU pods, balanced across NUMA nodes.
+        strategy: balanced-reserved-other-pods
+        reservedOtherPodsPerNuma: 2
+        cpuPodPool: all-remaining-balanced-across-numa
+
+    gpu-only:
+      cpuManagerPolicy: static
+      cpuManagerPolicyOptions: {}
+      topologyManagerPolicy: single-numa-node
+      placement:
+        # Prefer CPUs from the same NUMA node first.
+        strategy: same-numa-node-first
+
+    cpu-only:
+      cpuManagerPolicy: static
+      cpuManagerPolicyOptions: {}
+      topologyManagerPolicy: single-numa-node
+      placement:
+        # Prefer CPUs from the same NUMA node first.
+        strategy: same-numa-node-first
