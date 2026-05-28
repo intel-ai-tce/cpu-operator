@@ -42,6 +42,13 @@ rules:
       - kubeletconfigs
     verbs: ["get", "list", "watch", "create", "update", "patch"]
 
+
+  # OpenShift provider: optionally generate/apply Tuned CRs through Node Tuning Operator.
+  - apiGroups: ["tuned.openshift.io"]
+    resources:
+      - tuneds
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+
   - apiGroups: [""]
     resources: ["namespaces"]
     verbs: ["get", "list", "watch"]
