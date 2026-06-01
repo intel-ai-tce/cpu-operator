@@ -12,12 +12,12 @@ The operator keeps the runtime path Kubernetes-native:
 ## Goals
 
 - Discover CPU, NUMA, memory, thread-sibling, and optional GPU locality.
-- Classify nodes for CPU-only and mixed CPU/GPU inference.
+- Classify nodes with defined policies such as CPU-only and mixed CPU/GPU inference.
 - Generate NUMA-aware `reservedSystemCPUs`.
 - Configure OpenShift through native components: NFD, TuneD, MachineConfigPool, KubeletConfig, and MCO.
 - Support generic Kubernetes through rendered kubelet config and apply plans.
 - Validate workloads for Guaranteed QoS and CPU Manager eligibility.
-- Keep DRA optional and avoid NRI in the baseline design.
+- Keep DRA and NRI optional in the baseline design.
 
 ## Architecture
 
