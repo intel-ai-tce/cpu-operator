@@ -20,7 +20,7 @@ spec:
 
       containers:
         - name: agent
-          image: image-registry.openshift-image-registry.svc:5000/cpu-operator-images/node-topology-agent:dev
+          image: quay.io/louie_tsai/node-topology-agent:dev
           imagePullPolicy: Always
           env:
             - name: NAMESPACE
