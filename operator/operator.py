@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 from typing import Dict, List, Any, Tuple, Optional
+import hashlib
 import re
 
 import kopf
@@ -432,6 +433,17 @@ def phase4_reserved_system_cpus(node_class: str, placement: Dict[str, Any]) -> s
     return placement.get("systemReservedCPUSet", "")
 
 
+def topology_group_name(node_class: str, signature: str) -> str:
+    """Return a stable DNS-safe group name for a topology signature.
+
+    Do not use Python's built-in hash(); it is intentionally randomized
+    per interpreter process and would rename MCP/KubeletConfig objects after
+    every operator restart.
+    """
+    digest = hashlib.sha256(signature.encode("utf-8")).hexdigest()[:8]
+    return dns_safe_name(f"{node_class}-{digest}", 63)
+
+
 def topology_signature(topo_status: Dict, node_class: str, profile: Dict) -> str:
     numa_shapes = [f"{n.get('id')}:{len(expand_cpuset(n.get('cpus', '')))}" for n in sorted(topo_status.get("numaNodes") or [], key=lambda x: x.get("id", 0))]
     placement = profile.get("placement", {}) or {}
@@ -723,6 +735,7 @@ def reconcile_cpu_placement_policy(spec, name, namespace, logger, **_):
     nodes = list_nodes()
 
     node_classes, placement_by_node, legacy_reserved, topology_groups, labels_by_node = {}, {}, {}, {}, {}
+    merged_topology_by_node = {}
 
     for topo in topologies:
         topo_status = topo.get("status", {}) or {}
@@ -735,6 +748,7 @@ def reconcile_cpu_placement_policy(spec, name, namespace, logger, **_):
             continue
         labels = get_nested(node, ["metadata", "labels"], {}) or {}
         topo_status = merge_topology_with_node_features(topo_status, node)
+        merged_topology_by_node[node_name] = topo_status
         if not match_selector(labels, target_selector):
             logger.info("Skipping node %s: does not match targetNodeSelector", node_name)
             continue
@@ -744,7 +758,7 @@ def reconcile_cpu_placement_policy(spec, name, namespace, logger, **_):
         gpu_count = get_gpu_count(node, topo_status)
         placement = compute_placement_for_node(topo_status, node_class, profile)
         sig = topology_signature(topo_status, node_class, profile)
-        group_name = f"{node_class}-{abs(hash(sig)) % 100000:05d}"
+        group_name = topology_group_name(node_class, sig)
 
         placement_by_node[node_name] = placement
         legacy_reserved[node_name] = legacy_reserved_cpuset_from_placement(node_class, placement)
@@ -799,7 +813,7 @@ def reconcile_cpu_placement_policy(spec, name, namespace, logger, **_):
         generated_labels = build_node_labels(
             entry["class"],
             entry["gpuCount"],
-            next(t.get("status", {}) for t in topologies if (t.get("status", {}).get("nodeName") or t.get("spec", {}).get("nodeName")) == node_name),
+            merged_topology_by_node.get(node_name, {}),
             entry["topologyGroup"],
             entry["placement"],
             labels_spec,

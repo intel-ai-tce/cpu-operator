@@ -99,9 +99,9 @@ def read_pci_gpus() -> List[Dict]:
         numa_raw = read_text_optional(os.path.join(dev_path, "numa_node"))
         if not vendor or not pci_class:
             continue
-        is_display = pci_class.lower().startswith("0x0300") or pci_class.lower().startswith("0x0302")
+        is_gpu_class = pci_class.lower().startswith("0x0300") or pci_class.lower().startswith("0x0302")
         is_nvidia = vendor.lower() == "0x10de"
-        if not (is_display or is_nvidia):
+        if not is_gpu_class:
             continue
         try:
             numa = int(numa_raw) if numa_raw is not None else -1
