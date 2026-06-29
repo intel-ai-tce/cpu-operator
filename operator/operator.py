@@ -3,6 +3,7 @@
 from typing import Dict, List, Any, Tuple, Optional
 import hashlib
 import re
+import time
 
 import kopf
 import yaml
@@ -12,6 +13,7 @@ from kubernetes.client.rest import ApiException
 GROUP = "cpu.example.com"
 VERSION = "v1alpha1"
 TOPOLOGY_PLURAL = "nodecputopologies"
+POLICY_PLURAL = "cpuplacementpolicies"
 
 MCO_GROUP = "machineconfiguration.openshift.io"
 MCO_VERSION = "v1"
@@ -121,6 +123,39 @@ def all_numa_cpus(numa_nodes: List[Dict]) -> List[int]:
 def list_node_topologies(namespace: str) -> List[Dict]:
     api = client.CustomObjectsApi()
     return api.list_namespaced_custom_object(GROUP, VERSION, namespace, TOPOLOGY_PLURAL).get("items", [])
+
+
+def list_cpu_placement_policies(namespace: str) -> List[Dict]:
+    api = client.CustomObjectsApi()
+    return api.list_namespaced_custom_object(GROUP, VERSION, namespace, POLICY_PLURAL).get("items", [])
+
+
+def patch_cpu_placement_policy_status(namespace: str, name: str, status: Dict[str, Any], logger=None):
+    api = client.CustomObjectsApi()
+    try:
+        api.patch_namespaced_custom_object_status(
+            GROUP, VERSION, namespace, POLICY_PLURAL, name, {"status": status}
+        )
+    except ApiException as exc:
+        # Keep compatibility with an older CRD that has no status subresource yet.
+        if exc.status in (404, 405, 403):
+            if logger:
+                logger.warning("Could not patch CPUPlacementPolicy/%s status: %s", name, exc)
+            return
+        raise
+
+
+def trigger_policy_reconcile(namespace: str, policy_name: str, reason: str):
+    api = client.CustomObjectsApi()
+    annotation_key = "cpu.example.com/reconcile-trigger"
+    body = {
+        "metadata": {
+            "annotations": {
+                annotation_key: f"{reason}-{int(time.time())}",
+            }
+        }
+    }
+    api.patch_namespaced_custom_object(GROUP, VERSION, namespace, POLICY_PLURAL, policy_name, body)
 
 
 def list_nodes() -> Dict[str, Dict]:
@@ -853,10 +888,31 @@ def reconcile_cpu_placement_policy(spec, name, namespace, logger, **_):
     generic_cm_data["apply-plan.yaml"] = generic_apply_plan
     upsert_configmap(namespace, output_configmap, generic_cm_data)
 
+    patch_cpu_placement_policy_status(namespace, name, {
+        "provider": provider,
+        "providerStatus": provider_status,
+        "phase4Status": phase4_status,
+        "phase4Error": phase4_error,
+        "observedNodeCount": len(placement_by_node),
+        "observedTopologyGroupCount": len(topology_groups),
+        "computedConfigMap": f"{name}-computed-cpu-policy",
+        "genericOutputConfigMap": output_configmap,
+        "lastReconcileTime": int(time.time()),
+    }, logger=logger)
+
     logger.info("Reconciled CPUPlacementPolicy %s; provider=%s/%s nodes=%d groups=%d phase4=%s", name, provider.get("type"), provider.get("applyMode"), len(placement_by_node), len(topology_groups), phase4_status)
 
 
 @kopf.on.create(GROUP, VERSION, "nodecputopologies")
 @kopf.on.update(GROUP, VERSION, "nodecputopologies")
-def on_node_topology_change(namespace, logger, **_):
-    logger.info("NodeCPUTopology changed in namespace %s. Re-apply/update CPUPlacementPolicy to recompute immediately.", namespace)
+def on_node_topology_change(namespace, name, logger, **_):
+    policies = list_cpu_placement_policies(namespace)
+    for policy in policies:
+        policy_name = policy.get("metadata", {}).get("name")
+        if not policy_name:
+            continue
+        try:
+            trigger_policy_reconcile(namespace, policy_name, f"topology-{name}")
+        except Exception:
+            logger.exception("Failed to trigger reconcile for CPUPlacementPolicy/%s after NodeCPUTopology/%s changed", policy_name, name)
+    logger.info("NodeCPUTopology/%s changed in namespace %s; triggered %d CPUPlacementPolicy reconcile(s).", name, namespace, len(policies))
