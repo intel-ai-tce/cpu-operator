@@ -190,7 +190,7 @@ cat >> "${OUT}" <<EOF_MANIFEST
         - -lc
         - |
           echo "=== vLLM CPU placement test pod ==="
-          echo "Node: \\${NODE_NAME}"
+          echo "Node: \${NODE_NAME}"
           echo "Policy: ${POLICY}"
           echo "Expected policy CPU set: ${CPUSET}"
           echo "Expected CPU request/limit: ${CPU_COUNT}"
