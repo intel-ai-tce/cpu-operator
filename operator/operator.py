@@ -632,13 +632,14 @@ def normalize_provider(spec: Dict) -> Dict[str, Any]:
         if phase4:
             provider = {
                 "type": "OpenShift",
-                "applyMode": "Managed" if phase4.get("apply") else "RecommendationOnly",
+                "applyMode": "Managed" if phase4.get("apply", True) else "RecommendationOnly",
             }
         else:
             provider = {"type": "GenericKubernetes", "applyMode": "RecommendationOnly"}
 
     provider_type = str(provider.get("type", "GenericKubernetes"))
-    apply_mode = str(provider.get("applyMode", "RecommendationOnly"))
+    default_apply_mode = "Managed" if provider_type.lower() == "openshift" else "RecommendationOnly"
+    apply_mode = str(provider.get("applyMode", default_apply_mode))
     return {"type": provider_type, "applyMode": apply_mode}
 
 
