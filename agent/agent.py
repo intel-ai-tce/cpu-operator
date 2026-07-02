@@ -16,6 +16,17 @@ VERSION = "v1alpha1"
 PLURAL = "nodecputopologies"
 HOST_SYS = os.environ.get("HOST_SYS", "/host-sys")
 HOST_PROC = os.environ.get("HOST_PROC", "/host-proc")
+DEFAULT_GPU_VENDOR_ALLOWLIST = "0x10de"  # NVIDIA by default; avoids counting BMC VGA devices as AI GPUs.
+
+
+def normalized_gpu_vendor_allowlist() -> List[str]:
+    raw = os.environ.get("GPU_VENDOR_ALLOWLIST", DEFAULT_GPU_VENDOR_ALLOWLIST)
+    vendors = []
+    for item in raw.split(","):
+        vendor = item.strip().lower()
+        if vendor:
+            vendors.append(vendor)
+    return vendors or [DEFAULT_GPU_VENDOR_ALLOWLIST]
 
 
 def read_text(path: str) -> str:
@@ -90,7 +101,21 @@ def read_amx_capabilities() -> Dict:
 
 
 def read_pci_gpus() -> List[Dict]:
+    """Return PCI devices that should be treated as AI accelerator GPUs.
+
+    PCI class 0x0300/0x0302 means VGA/3D controller, but many servers also have
+    an onboard BMC VGA controller such as ASPEED 0x1a03:0x2000. That device is
+    useful for console display, but it is not a GPU for LLM inference placement.
+
+    Therefore the default detection requires both:
+      * GPU/display PCI class, and
+      * an allowed accelerator vendor, default NVIDIA 0x10de.
+
+    Additional vendors can be enabled with GPU_VENDOR_ALLOWLIST, for example:
+      GPU_VENDOR_ALLOWLIST=0x10de,0x1002,0x8086
+    """
     out = []
+    allowed_vendors = normalized_gpu_vendor_allowlist()
     for dev_path in sorted(glob.glob(f"{HOST_SYS}/bus/pci/devices/*")):
         address = os.path.basename(dev_path)
         vendor = read_text_optional(os.path.join(dev_path, "vendor"))
@@ -99,9 +124,12 @@ def read_pci_gpus() -> List[Dict]:
         numa_raw = read_text_optional(os.path.join(dev_path, "numa_node"))
         if not vendor or not pci_class:
             continue
-        is_gpu_class = pci_class.lower().startswith("0x0300") or pci_class.lower().startswith("0x0302")
-        is_nvidia = vendor.lower() == "0x10de"
-        if not is_gpu_class:
+        vendor_l = vendor.lower()
+        class_l = pci_class.lower()
+        is_gpu_class = class_l.startswith("0x0300") or class_l.startswith("0x0302")
+        is_allowed_vendor = vendor_l in allowed_vendors
+        is_nvidia = vendor_l == "0x10de"
+        if not (is_gpu_class and is_allowed_vendor):
             continue
         try:
             numa = int(numa_raw) if numa_raw is not None else -1
@@ -114,6 +142,7 @@ def read_pci_gpus() -> List[Dict]:
             "class": pci_class,
             "numaNode": numa,
             "isNvidia": is_nvidia,
+            "detection": "pci-class-and-allowed-vendor",
         })
     return out
 
@@ -168,6 +197,7 @@ def main():
                 g["numaNode"] for g in gpus
                 if isinstance(g.get("numaNode"), int) and g["numaNode"] >= 0
             }),
+            "gpuVendorAllowlist": normalized_gpu_vendor_allowlist(),
             "amx": amx,
             "conditions": [
                 {"type": "TopologyReady", "status": "True" if numa_nodes else "False"},

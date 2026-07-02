@@ -40,7 +40,7 @@ spec:
     pauseMachineConfigPool: false
 
   classification:
-    overrideLabel: cpu.example.com/node-class
+    overrideLabel: cpu.example.com/node-class-override
     amxNodeSelector:
       node-role.kubernetes.io/inference: ""
     gpuOnlyNodeSelector:

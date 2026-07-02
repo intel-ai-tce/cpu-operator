@@ -27,6 +27,11 @@ spec:
               value: cpu-operator-system
             - name: INTERVAL_SECONDS
               value: "60"
+            # Default to NVIDIA accelerator GPUs only. This avoids counting onboard
+            # BMC VGA devices such as ASPEED as AI GPUs. Add vendors if needed, for
+            # example: "0x10de,0x1002,0x8086" for NVIDIA, AMD, Intel.
+            - name: GPU_VENDOR_ALLOWLIST
+              value: "0x10de"
             - name: NODE_NAME
               valueFrom:
                 fieldRef:

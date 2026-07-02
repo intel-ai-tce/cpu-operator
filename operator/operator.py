@@ -299,8 +299,14 @@ def merge_topology_with_node_features(topo_status: Dict, node: Dict) -> Dict:
 def classify_node(node: Dict, topo_status: Dict, spec: Dict) -> Tuple[str, Dict[str, Any]]:
     labels = get_nested(node, ["metadata", "labels"], {}) or {}
     classification = spec.get("classification", {}) or {}
-    override_key = classification.get("overrideLabel", "cpu.example.com/node-class")
+    # Use a separate manual override label so the operator does not treat its own
+    # generated cpu.example.com/node-class label as an override on later reconciles.
+    generated_node_class_label = "cpu.example.com/node-class"
+    override_key = classification.get("overrideLabel", "cpu.example.com/node-class-override")
+    allow_generated_override = bool(classification.get("allowGeneratedNodeClassAsOverride", False))
     override = labels.get(override_key)
+    if override_key == generated_node_class_label and not allow_generated_override:
+        override = None
 
     gpu_count = get_gpu_count(node, topo_status)
     cpu_count = total_logical_cpus(topo_status.get("numaNodes") or [])

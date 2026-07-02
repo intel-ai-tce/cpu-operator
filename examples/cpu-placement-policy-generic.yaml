@@ -19,7 +19,7 @@ spec:
     outputConfigMap: generic-vllm-cpu-policy-generated-kubelet-config
 
   classification:
-    overrideLabel: cpu.example.com/node-class
+    overrideLabel: cpu.example.com/node-class-override
     cpuAmxMinLogicalCPUs: 64
 
   profiles:
