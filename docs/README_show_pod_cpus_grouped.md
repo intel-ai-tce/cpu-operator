@@ -121,7 +121,7 @@ LIVE=1 VIEW=grouped \
   scripts/show-pod-cpus-grouped.sh "$NODE"
 ```
 
-This compares the CPU Manager checkpoint with the effective cpuset inside every matched container.
+This compares the CPU Manager checkpoint with each container process's allowed CPU set (`Cpus_allowed_list`).
 
 ### Grouped and detailed views
 
@@ -334,7 +334,14 @@ CPU RANGE       GROUPS   TYPE        PODS  CONTAINERS  INTERPRETATION
 With `LIVE=1`, the report compares:
 
 - `manager`: the CPU set recorded by kubelet CPU Manager;
-- `live`: the effective cpuset enforced in the container cgroup.
+- `live`: the CPU affinity reported for the executed process by
+  `/proc/self/status` as `Cpus_allowed_list`.
+
+The process affinity is used as the primary live value because some privileged or
+host-integrated containers expose the host cgroup root at `/sys/fs/cgroup`. The
+root `cpuset.cpus.effective` can show every node CPU even when the container
+process is correctly restricted. Cgroup cpuset files remain fallback sources when
+`/proc/self/status` is unavailable.
 
 Expected result:
 
@@ -424,6 +431,22 @@ Confirm all kube-apiserver static pods have converged on the same revision befor
 ### Live cpuset is unavailable for one container
 
 The container might not contain `sh`, `cat`, or `awk`, or the user might lack exec permission. The CPU Manager checkpoint view can still provide the manager assignment.
+
+### Root-visible cgroup cpuset is broader than process affinity
+
+Privileged and host-integrated containers can expose the host cgroup root inside
+`/sys/fs/cgroup`. For example:
+
+```text
+manager=0,22-23,45-48,70-71,93-95
+process_allowed=0,22-23,45-48,70-71,93-95
+visible_cgroup_root=0-95
+```
+
+This is not a CPU isolation failure. The process affinity matches CPU Manager,
+while the root-visible cgroup file describes a broader cgroup level. The script
+uses `Cpus_allowed_list` first to avoid creating a false shared group from the
+root-visible value.
 
 ### Every container is shown as shared on `0-95`
 

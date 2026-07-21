@@ -16,7 +16,7 @@ set -euo pipefail
 #
 # Environment:
 #   CLI=oc                    Kubernetes CLI. Defaults to oc.
-#   LIVE=1                    Read effective cpuset inside every matched container.
+#   LIVE=1                    Read each process CPU affinity and compare it with CPU Manager.
 #   EXPAND=1                  Print 0,1,2,3 instead of compact 0-3 notation.
 #   DEBUG=1                   Print every external command and full error details.
 #   NO_PROGRESS=1             Suppress progress messages.
@@ -428,15 +428,19 @@ for index, (
         status(
             f"[{index}/{len(matched_containers)}] Reading live cpuset: {identity}"
         )
+        # Use process affinity first. Privileged and host-integrated containers may
+        # expose the host cgroup root at /sys/fs/cgroup. In those containers,
+        # root cpuset.cpus.effective can be broader than the process affinity and
+        # would create a false CPU Manager/live mismatch.
         live_cmd = r'''
-if [ -r /sys/fs/cgroup/cpuset.cpus.effective ]; then
+if [ -r /proc/self/status ]; then
+    awk '/^Cpus_allowed_list:/ {print $2; exit}' /proc/self/status
+elif [ -r /sys/fs/cgroup/cpuset.cpus.effective ]; then
     cat /sys/fs/cgroup/cpuset.cpus.effective
 elif [ -r /sys/fs/cgroup/cpuset.cpus ]; then
     cat /sys/fs/cgroup/cpuset.cpus
 elif [ -r /sys/fs/cgroup/cpuset/cpuset.cpus ]; then
     cat /sys/fs/cgroup/cpuset/cpuset.cpus
-elif [ -r /proc/self/status ]; then
-    awk '/^Cpus_allowed_list:/ {print $2; exit}' /proc/self/status
 else
     exit 1
 fi
