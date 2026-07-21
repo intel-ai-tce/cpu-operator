@@ -189,17 +189,71 @@ cat >> "${OUT}" <<EOF_MANIFEST
         - /bin/bash
         - -lc
         - |
+          count_cpuset() {
+            local cpuset="\$1"
+            local total=0
+            local part start end
+            local -a parts
+
+            IFS=',' read -r -a parts <<< "\${cpuset}"
+            for part in "\${parts[@]}"; do
+              part="\${part//[[:space:]]/}"
+              [[ -z "\${part}" ]] && continue
+
+              if [[ "\${part}" == *-* ]]; then
+                start="\${part%%-*}"
+                end="\${part##*-}"
+                total=\$((total + end - start + 1))
+              else
+                total=\$((total + 1))
+              fi
+            done
+
+            printf '%s\n' "\${total}"
+          }
+
+          POLICY_CPUSET="${CPUSET}"
+          EXPECTED_CPU_COUNT="${CPU_COUNT}"
+          ACTUAL_CPUSET="\$(awk '/^Cpus_allowed_list:/ {print \$2}' /proc/self/status)"
+          EFFECTIVE_CPUSET="\$(cat /sys/fs/cgroup/cpuset.cpus.effective 2>/dev/null || cat /sys/fs/cgroup/cpuset/cpuset.cpus 2>/dev/null || true)"
+          ACTUAL_CPU_COUNT="\$(count_cpuset "\${ACTUAL_CPUSET}")"
+
           echo "=== vLLM CPU placement test pod ==="
           echo "Node: \${NODE_NAME}"
           echo "Policy: ${POLICY}"
-          echo "Expected policy CPU set: ${CPUSET}"
-          echo "Expected CPU request/limit: ${CPU_COUNT}"
+          echo "Policy-recommended CPU set: \${POLICY_CPUSET}"
+          echo "Policy-required CPU count: \${EXPECTED_CPU_COUNT}"
           echo "Expected node class: ${NODE_CLASS:-unknown}"
           echo "Expected topology group: ${TOPOLOGY_GROUP:-unknown}"
           echo "Expected placement strategy: ${PLACEMENT_STRATEGY:-unknown}"
           echo
-          echo "Actual Cpus_allowed_list from /proc/self/status:"
-          grep Cpus_allowed_list /proc/self/status
+          echo "Kubelet-assigned exclusive CPU set: \${ACTUAL_CPUSET}"
+          if [[ -n "\${EFFECTIVE_CPUSET}" ]]; then
+            echo "Effective cgroup CPU set: \${EFFECTIVE_CPUSET}"
+          fi
+          echo "Actual exclusive CPU count: \${ACTUAL_CPU_COUNT}"
+          echo
+
+          if [[ "\${ACTUAL_CPU_COUNT}" -eq "\${EXPECTED_CPU_COUNT}" ]]; then
+            echo "[PASS] CPU count: expected=\${EXPECTED_CPU_COUNT} actual=\${ACTUAL_CPU_COUNT}"
+          else
+            echo "[FAIL] CPU count: expected=\${EXPECTED_CPU_COUNT} actual=\${ACTUAL_CPU_COUNT}"
+            exit 1
+          fi
+
+          if [[ "\${ACTUAL_CPUSET}" == "\${POLICY_CPUSET}" ]]; then
+            echo "[PASS] Exact CPU IDs match the policy recommendation"
+          else
+            echo "[INFO] Exact CPU IDs differ from the policy recommendation"
+            echo "[INFO] This is valid when kubelet CPU Manager receives only an integer CPU request."
+            echo "[INFO] Validate CPU count, NUMA distribution, full-core allocation, and checkpoint state."
+          fi
+
+          if [[ -n "\${EFFECTIVE_CPUSET}" && "\${EFFECTIVE_CPUSET}" != "\${ACTUAL_CPUSET}" ]]; then
+            echo "[WARN] /proc/self/status and cgroup effective cpuset differ"
+          else
+            echo "[PASS] Process affinity matches the effective cgroup cpuset"
+          fi
           echo
           echo "Container will sleep for inspection."
           sleep infinity
@@ -238,3 +292,5 @@ echo
 echo "Validate with:"
 echo "  oc get pod ${POD_NAME} -n ${POD_NAMESPACE} -o wide"
 echo "  oc logs ${POD_NAME} -n ${POD_NAMESPACE}"
+printf '  oc debug node/%s --quiet -- \\\n' "${NODE}"
+echo "    chroot /host cat /var/lib/kubelet/cpu_manager_state"

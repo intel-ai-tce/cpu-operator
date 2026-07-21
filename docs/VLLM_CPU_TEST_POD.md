@@ -37,7 +37,8 @@ oc get pod vllm-cpu-test -n default -o wide
 oc logs vllm-cpu-test -n default
 ```
 
-The log prints both the expected policy CPU set and the actual `Cpus_allowed_list` seen inside the container.
+The log prints the policy-recommended CPU set, the required CPU count, the
+kubelet-assigned CPU set, the effective cgroup CPU set, and validation results.
 
 ## Example with current policy
 
@@ -95,10 +96,51 @@ Or explicitly set the ConfigMap:
 CM_NAME=my-cpu-policy-computed-cpu-policy ./scripts/generate-vllm-cpu-test-pod.sh
 ```
 
+## Expected validation behavior
+
+The generated workload validates the properties that kubelet CPU Manager can
+enforce from a normal Pod resource request:
+
+- the Pod receives the requested number of exclusive logical CPUs;
+- `/proc/self/status` matches the effective cgroup cpuset;
+- the Pod remains available for checkpoint and topology inspection.
+
+Example output:
+
+```text
+Policy-recommended CPU set: 3-23,27-47,51-71,75-95
+Policy-required CPU count: 84
+Kubelet-assigned exclusive CPU set: 1-21,24-44,49-69,72-92
+Effective cgroup CPU set: 1-21,24-44,49-69,72-92
+Actual exclusive CPU count: 84
+
+[PASS] CPU count: expected=84 actual=84
+[INFO] Exact CPU IDs differ from the policy recommendation
+[INFO] This is valid when kubelet CPU Manager receives only an integer CPU request.
+[PASS] Process affinity matches the effective cgroup cpuset
+```
+
+After the Pod starts, inspect the kubelet CPU Manager checkpoint:
+
+```bash
+oc debug node/<worker-node> --quiet -- \
+  chroot /host \
+  cat /var/lib/kubelet/cpu_manager_state
+```
+
 ## Important limitation
 
 This script makes the pod request the same **number of CPUs** as the computed `cpuPodCPUSet`.
 
 Kubelet CPU Manager can allocate exclusive CPUs for a Guaranteed pod when `cpuManagerPolicy: static` is active. However, kubelet does not understand the operator's conceptual `cpuPodCPUSet` and `gpuPodCPUSet` pools by itself.
 
-Therefore, the actual `Cpus_allowed_list` may not exactly match the recommended `cpuPodCPUSet` unless additional cpuset enforcement is used.
+Therefore, the actual `Cpus_allowed_list` may not exactly match the recommended
+`cpuPodCPUSet` unless additional cpuset enforcement is used. An exact-ID
+difference is informational when all of the following are true:
+
+- the assigned CPU count matches the requested CPU count;
+- CPU Manager records an exclusive checkpoint entry for the container;
+- exclusive and shared CPU sets do not overlap;
+- the allocation satisfies the configured NUMA and full-core policy options.
+
+Do not treat an exact-ID difference alone as a placement failure.
