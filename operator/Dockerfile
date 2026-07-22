@@ -6,4 +6,4 @@ COPY operator.py /app/operator.py
 
 USER 1001
 
-ENTRYPOINT ["kopf", "run", "/app/operator.py", "--namespace", "cpu-operator-system"]
+ENTRYPOINT ["sh", "-c", "exec kopf run /app/operator.py --namespace ${WATCH_NAMESPACE:-cpu-operator-system}"]

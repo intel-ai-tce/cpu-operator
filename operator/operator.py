@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 
 from typing import Dict, List, Any, Tuple, Optional
+import hashlib
 import re
+import time
 
 import kopf
 import yaml
@@ -11,11 +13,17 @@ from kubernetes.client.rest import ApiException
 GROUP = "cpu.example.com"
 VERSION = "v1alpha1"
 TOPOLOGY_PLURAL = "nodecputopologies"
+POLICY_PLURAL = "cpuplacementpolicies"
 
 MCO_GROUP = "machineconfiguration.openshift.io"
 MCO_VERSION = "v1"
 MCP_PLURAL = "machineconfigpools"
 KUBELETCONFIG_PLURAL = "kubeletconfigs"
+
+TUNED_GROUP = "tuned.openshift.io"
+TUNED_VERSION = "v1"
+TUNED_PLURAL = "tuneds"
+TUNED_NAMESPACE = "openshift-cluster-node-tuning-operator"
 
 VALID_CLASSES = {"mixed-cpu-amx-gpu", "cpu-amx", "cpu-only", "gpu-only"}
 
@@ -117,6 +125,39 @@ def list_node_topologies(namespace: str) -> List[Dict]:
     return api.list_namespaced_custom_object(GROUP, VERSION, namespace, TOPOLOGY_PLURAL).get("items", [])
 
 
+def list_cpu_placement_policies(namespace: str) -> List[Dict]:
+    api = client.CustomObjectsApi()
+    return api.list_namespaced_custom_object(GROUP, VERSION, namespace, POLICY_PLURAL).get("items", [])
+
+
+def patch_cpu_placement_policy_status(namespace: str, name: str, status: Dict[str, Any], logger=None):
+    api = client.CustomObjectsApi()
+    try:
+        api.patch_namespaced_custom_object_status(
+            GROUP, VERSION, namespace, POLICY_PLURAL, name, {"status": status}
+        )
+    except ApiException as exc:
+        # Keep compatibility with an older CRD that has no status subresource yet.
+        if exc.status in (404, 405, 403):
+            if logger:
+                logger.warning("Could not patch CPUPlacementPolicy/%s status: %s", name, exc)
+            return
+        raise
+
+
+def trigger_policy_reconcile(namespace: str, policy_name: str, reason: str):
+    api = client.CustomObjectsApi()
+    annotation_key = "cpu.example.com/reconcile-trigger"
+    body = {
+        "metadata": {
+            "annotations": {
+                annotation_key: f"{reason}-{int(time.time())}",
+            }
+        }
+    }
+    api.patch_namespaced_custom_object(GROUP, VERSION, namespace, POLICY_PLURAL, policy_name, body)
+
+
 def list_nodes() -> Dict[str, Dict]:
     return {n.metadata.name: n.to_dict() for n in client.CoreV1Api().list_node().items}
 
@@ -146,6 +187,18 @@ def upsert_cluster_custom_object(group: str, version: str, plural: str, name: st
     except ApiException as e:
         if e.status == 404:
             api.create_cluster_custom_object(group, version, plural, body)
+        else:
+            raise
+
+
+def upsert_namespaced_custom_object(group: str, version: str, namespace: str, plural: str, name: str, body: Dict):
+    api = client.CustomObjectsApi()
+    try:
+        api.get_namespaced_custom_object(group, version, namespace, plural, name)
+        api.patch_namespaced_custom_object(group, version, namespace, plural, name, body)
+    except ApiException as e:
+        if e.status == 404:
+            api.create_namespaced_custom_object(group, version, namespace, plural, body)
         else:
             raise
 
@@ -215,11 +268,45 @@ def total_logical_cpus(numa_nodes: List[Dict]) -> int:
     return len(all_numa_cpus(numa_nodes))
 
 
+def merge_topology_with_node_features(topo_status: Dict, node: Dict) -> Dict:
+    """Merge NFD/GPU Operator node labels into topology status.
+
+    NFD is the preferred source for generic feature labels when available.
+    The Node Topology Agent remains the source for placement-grade NUMA/core/GPU locality.
+    """
+    merged = dict(topo_status or {})
+    labels = get_nested(node, ["metadata", "labels"], {}) or {}
+    amx = dict(merged.get("amx") or {})
+
+    if labels.get("feature.node.kubernetes.io/cpu-cpuid.AMX_BF16") == "true":
+        amx["amx_bf16"] = True
+    if labels.get("feature.node.kubernetes.io/cpu-cpuid.AMX_INT8") == "true":
+        amx["amx_int8"] = True
+    if labels.get("feature.node.kubernetes.io/cpu-cpuid.AMX_TILE") == "true":
+        amx["amx_tile"] = True
+    if labels.get("feature.node.kubernetes.io/cpu-cpuid.AMX_FP16") == "true":
+        amx["amx_fp16"] = True
+
+    merged["amx"] = amx
+    merged["featureSources"] = {
+        "nfd": any(k.startswith("feature.node.kubernetes.io/") for k in labels),
+        "nodeTopologyAgent": True,
+        "gpuOperatorAllocatable": bool(get_nested(node, ["status", "allocatable"], {}) or {}),
+    }
+    return merged
+
+
 def classify_node(node: Dict, topo_status: Dict, spec: Dict) -> Tuple[str, Dict[str, Any]]:
     labels = get_nested(node, ["metadata", "labels"], {}) or {}
     classification = spec.get("classification", {}) or {}
-    override_key = classification.get("overrideLabel", "cpu.example.com/node-class")
+    # Use a separate manual override label so the operator does not treat its own
+    # generated cpu.example.com/node-class label as an override on later reconciles.
+    generated_node_class_label = "cpu.example.com/node-class"
+    override_key = classification.get("overrideLabel", "cpu.example.com/node-class-override")
+    allow_generated_override = bool(classification.get("allowGeneratedNodeClassAsOverride", False))
     override = labels.get(override_key)
+    if override_key == generated_node_class_label and not allow_generated_override:
+        override = None
 
     gpu_count = get_gpu_count(node, topo_status)
     cpu_count = total_logical_cpus(topo_status.get("numaNodes") or [])
@@ -387,6 +474,17 @@ def phase4_reserved_system_cpus(node_class: str, placement: Dict[str, Any]) -> s
     return placement.get("systemReservedCPUSet", "")
 
 
+def topology_group_name(node_class: str, signature: str) -> str:
+    """Return a stable DNS-safe group name for a topology signature.
+
+    Do not use Python's built-in hash(); it is intentionally randomized
+    per interpreter process and would rename MCP/KubeletConfig objects after
+    every operator restart.
+    """
+    digest = hashlib.sha256(signature.encode("utf-8")).hexdigest()[:8]
+    return dns_safe_name(f"{node_class}-{digest}", 63)
+
+
 def topology_signature(topo_status: Dict, node_class: str, profile: Dict) -> str:
     numa_shapes = [f"{n.get('id')}:{len(expand_cpuset(n.get('cpus', '')))}" for n in sorted(topo_status.get("numaNodes") or [], key=lambda x: x.get("id", 0))]
     placement = profile.get("placement", {}) or {}
@@ -463,12 +561,7 @@ def build_kubelet_config(group_name: str, group: Dict, phase4: Dict) -> Dict:
         for p in (group.get("placementByNode") or {}).values()
         if p.get("systemReservedCPUSet")
     })
-    kubelet_config = {
-        "cpuManagerPolicy": group.get("cpuManagerPolicy", "static"),
-        "cpuManagerPolicyOptions": group.get("cpuManagerPolicyOptions", {}),
-        "topologyManagerPolicy": group.get("topologyManagerPolicy", "restricted"),
-        "topologyManagerScope": phase4.get("topologyManagerScope", "pod"),
-    }
+    kubelet_config = kubelet_config_from_group(group, phase4)
     if len(reserved_values) == 1:
         kubelet_config["reservedSystemCPUs"] = reserved_values[0]
     elif len(reserved_values) > 1:
@@ -530,6 +623,128 @@ def build_node_labels(node_class: str, gpu_count: int, topo_status: Dict, group_
     }
 
 
+def normalize_provider(spec: Dict) -> Dict[str, Any]:
+    provider = dict(spec.get("provider") or {})
+
+    # Backward compatibility with the original phase4 OpenShift-only schema.
+    phase4 = dict(spec.get("phase4") or {})
+    if not provider:
+        if phase4:
+            provider = {
+                "type": "OpenShift",
+                "applyMode": "Managed" if phase4.get("apply", True) else "RecommendationOnly",
+            }
+        else:
+            provider = {"type": "GenericKubernetes", "applyMode": "RecommendationOnly"}
+
+    provider_type = str(provider.get("type", "GenericKubernetes"))
+    default_apply_mode = "Managed" if provider_type.lower() == "openshift" else "RecommendationOnly"
+    apply_mode = str(provider.get("applyMode", default_apply_mode))
+    return {"type": provider_type, "applyMode": apply_mode}
+
+
+def effective_phase4(spec: Dict, provider: Dict[str, Any]) -> Dict[str, Any]:
+    phase4 = dict(spec.get("phase4") or {})
+    if provider.get("type", "").lower() == "openshift":
+        phase4.setdefault("enabled", True)
+        phase4["apply"] = provider.get("applyMode") == "Managed" or bool(phase4.get("apply"))
+        openshift = spec.get("openshift") or {}
+        if openshift.get("machineConfigPoolNamePrefix"):
+            phase4["machineConfigPoolNamePrefix"] = openshift.get("machineConfigPoolNamePrefix")
+        if openshift.get("topologyManagerScope"):
+            phase4["topologyManagerScope"] = openshift.get("topologyManagerScope")
+    return phase4
+
+
+def kubelet_config_from_group(group: Dict, phase4: Dict, reserved_system_cpus: str = "") -> Dict[str, Any]:
+    cfg = {
+        "cpuManagerPolicy": group.get("cpuManagerPolicy", "static"),
+        "cpuManagerPolicyOptions": group.get("cpuManagerPolicyOptions", {}),
+        "topologyManagerPolicy": group.get("topologyManagerPolicy", "restricted"),
+        "topologyManagerScope": phase4.get("topologyManagerScope", "pod"),
+    }
+    if reserved_system_cpus:
+        cfg["reservedSystemCPUs"] = reserved_system_cpus
+    return cfg
+
+
+def render_generic_kubelet_configs(node_classes: Dict[str, Dict], phase4: Dict) -> Dict[str, str]:
+    rendered = {}
+    for node_name, entry in sorted(node_classes.items()):
+        placement = entry.get("placement") or {}
+        reserved = phase4_reserved_system_cpus(entry.get("class", ""), placement)
+        group = {
+            "cpuManagerPolicy": placement.get("cpuManagerPolicy", "static"),
+            "cpuManagerPolicyOptions": placement.get("cpuManagerPolicyOptions", {}),
+            "topologyManagerPolicy": placement.get("topologyManagerPolicy", "restricted"),
+        }
+        cfg = kubelet_config_from_group(group, phase4, reserved)
+        cfg = {"apiVersion": "kubelet.config.k8s.io/v1beta1", "kind": "KubeletConfiguration", **cfg}
+        rendered[node_name] = yaml.safe_dump(cfg, sort_keys=False)
+    return rendered
+
+
+def render_generic_apply_plan(node_classes: Dict[str, Dict], output_configmap: str) -> str:
+    plan = {
+        "warning": "Generic Kubernetes has no MachineConfigPool/MCO equivalent. This plan must be applied by kubeadm, Cluster API, external automation, or an explicitly enabled privileged node-agent.",
+        "outputConfigMap": output_configmap,
+        "safeNodeUpdateFlow": [
+            "cordon/drain node",
+            "stop kubelet",
+            "backup kubelet config",
+            "write updated kubelet config",
+            "remove /var/lib/kubelet/cpu_manager_state",
+            "start kubelet",
+            "wait for Node Ready",
+            "uncordon node",
+            "validate CPU Manager static policy",
+        ],
+        "nodes": {},
+    }
+    for node_name, entry in sorted(node_classes.items()):
+        plan["nodes"][node_name] = {
+            "nodeClass": entry.get("class"),
+            "topologyGroup": entry.get("topologyGroup"),
+            "kubeletConfigKey": f"{node_name}.kubelet-config.yaml",
+            "reservedSystemCPUs": phase4_reserved_system_cpus(entry.get("class", ""), entry.get("placement") or {}),
+        }
+    return yaml.safe_dump(plan, sort_keys=False)
+
+
+def build_tuned_cr(spec: Dict, labels_spec: Dict) -> Optional[Dict[str, Any]]:
+    openshift = spec.get("openshift") or {}
+    if not bool(openshift.get("manageTuned", False)):
+        return None
+
+    profile_name = openshift.get("tunedProfile", "openshift-node-llm-compute")
+    recommend_label = openshift.get("tunedMachineConfigLabel", "worker")
+    kernel_args = openshift.get("kernelArgs", ["intel_pstate=active"])
+    include_profile = openshift.get("includeProfile", "network-latency")
+
+    bootline = " ".join(f"+{arg}" for arg in kernel_args)
+    tuned_data = f"""[main]\nsummary=Custom OpenShift node profile for CPU inference workloads\ninclude={include_profile}\n\n[bootloader]\ncmdline_cpu_operator={bootline}\n"""
+    return {
+        "apiVersion": f"{TUNED_GROUP}/{TUNED_VERSION}",
+        "kind": "Tuned",
+        "metadata": {"name": profile_name, "namespace": TUNED_NAMESPACE},
+        "spec": {
+            "profile": [{"name": profile_name, "data": tuned_data}],
+            "recommend": [{
+                "machineConfigLabels": {"machineconfiguration.openshift.io/role": recommend_label},
+                "priority": int(openshift.get("tunedPriority", 20)),
+                "profile": profile_name,
+            }],
+        },
+    }
+
+
+def apply_tuned_cr(tuned_cr: Optional[Dict[str, Any]]):
+    if not tuned_cr:
+        return
+    meta = tuned_cr.get("metadata", {})
+    upsert_namespaced_custom_object(TUNED_GROUP, TUNED_VERSION, meta.get("namespace", TUNED_NAMESPACE), TUNED_PLURAL, meta["name"], tuned_cr)
+
+
 def render_kubelet_config_by_group(groups: Dict[str, Dict], phase4: Dict) -> str:
     manifests = build_phase4_manifests(groups, phase4)
     return yaml.safe_dump({
@@ -553,14 +768,16 @@ def configure(settings: kopf.OperatorSettings, **_):
 def reconcile_cpu_placement_policy(spec, name, namespace, logger, **_):
     target_selector = spec.get("targetNodeSelector") or spec.get("nodeSelector") or {"node-role.kubernetes.io/worker": ""}
     labels_spec = spec.get("nodeLabels", {}) or {}
-    phase4 = spec.get("phase4", {}) or {}
-    phase4_enabled = bool(phase4.get("enabled", False))
-    phase4_apply = bool(phase4.get("apply", False))
+    provider = normalize_provider(spec)
+    phase4 = effective_phase4(spec, provider)
+    phase4_enabled = provider.get("type", "").lower() == "openshift" and bool(phase4.get("enabled", False))
+    phase4_apply = phase4_enabled and provider.get("applyMode") == "Managed"
 
     topologies = list_node_topologies(namespace)
     nodes = list_nodes()
 
     node_classes, placement_by_node, legacy_reserved, topology_groups, labels_by_node = {}, {}, {}, {}, {}
+    merged_topology_by_node = {}
 
     for topo in topologies:
         topo_status = topo.get("status", {}) or {}
@@ -572,6 +789,8 @@ def reconcile_cpu_placement_policy(spec, name, namespace, logger, **_):
             logger.warning("Skipping topology %s: node object not found", node_name)
             continue
         labels = get_nested(node, ["metadata", "labels"], {}) or {}
+        topo_status = merge_topology_with_node_features(topo_status, node)
+        merged_topology_by_node[node_name] = topo_status
         if not match_selector(labels, target_selector):
             logger.info("Skipping node %s: does not match targetNodeSelector", node_name)
             continue
@@ -581,7 +800,7 @@ def reconcile_cpu_placement_policy(spec, name, namespace, logger, **_):
         gpu_count = get_gpu_count(node, topo_status)
         placement = compute_placement_for_node(topo_status, node_class, profile)
         sig = topology_signature(topo_status, node_class, profile)
-        group_name = f"{node_class}-{abs(hash(sig)) % 100000:05d}"
+        group_name = topology_group_name(node_class, sig)
 
         placement_by_node[node_name] = placement
         legacy_reserved[node_name] = legacy_reserved_cpuset_from_placement(node_class, placement)
@@ -611,26 +830,32 @@ def reconcile_cpu_placement_policy(spec, name, namespace, logger, **_):
         topology_groups[group_name]["placementByNode"][node_name] = placement
 
     phase4_manifests = build_phase4_manifests(topology_groups, phase4) if phase4_enabled else {"machineConfigPools": {}, "kubeletConfigs": {}}
+    tuned_cr = build_tuned_cr(spec, labels_spec) if provider.get("type", "").lower() == "openshift" else None
     phase4_status = "disabled"
     phase4_error = ""
+    provider_status = "recommendation-only"
 
     if phase4_enabled and phase4_apply:
         try:
             apply_phase4_manifests(phase4_manifests)
+            apply_tuned_cr(tuned_cr)
             phase4_status = "applied"
+            provider_status = "managed-applied"
         except Exception as exc:
             phase4_status = "apply-failed"
+            provider_status = "apply-failed"
             phase4_error = str(exc)
-            logger.exception("Failed to apply Phase 4 manifests")
+            logger.exception("Failed to apply OpenShift provider manifests")
     elif phase4_enabled:
         phase4_status = "generated-only"
+        provider_status = "openshift-generated-only"
 
     enable_labels = bool(labels_spec.get("enabled", spec.get("enableNodeLabels", True)))
     for node_name, entry in node_classes.items():
         generated_labels = build_node_labels(
             entry["class"],
             entry["gpuCount"],
-            next(t.get("status", {}) for t in topologies if (t.get("status", {}).get("nodeName") or t.get("spec", {}).get("nodeName")) == node_name),
+            merged_topology_by_node.get(node_name, {}),
             entry["topologyGroup"],
             entry["placement"],
             labels_spec,
@@ -640,8 +865,14 @@ def reconcile_cpu_placement_policy(spec, name, namespace, logger, **_):
         if enable_labels:
             patch_node_labels(node_name, generated_labels)
 
+    output_configmap = (spec.get("generic") or {}).get("outputConfigMap", f"{name}-generated-kubelet-config")
+    generic_kubelet_configs = render_generic_kubelet_configs(node_classes, phase4)
+    generic_apply_plan = render_generic_apply_plan(node_classes, output_configmap)
+
     data = {
         "policyName": name,
+        "provider.yaml": yaml.safe_dump(provider, sort_keys=True),
+        "providerStatus": provider_status,
         "phase4Status": phase4_status,
         "phase4Error": phase4_error,
         "targetNodeSelector.yaml": yaml.safe_dump(target_selector, sort_keys=True),
@@ -650,15 +881,45 @@ def reconcile_cpu_placement_policy(spec, name, namespace, logger, **_):
         "cpuPlacementByNode.yaml": yaml.safe_dump(placement_by_node, sort_keys=True),
         "reservedSystemCPUsByNode.yaml": yaml.safe_dump(legacy_reserved, sort_keys=True),
         "generatedNodeLabels.yaml": yaml.safe_dump(labels_by_node, sort_keys=True),
+        "genericKubeletConfigs.yaml": yaml.safe_dump(generic_kubelet_configs, sort_keys=True),
+        "genericApplyPlan.yaml": generic_apply_plan,
+        "openshiftTuned.yaml": yaml.safe_dump(tuned_cr or {}, sort_keys=True),
         "phase4MachineConfigPools.yaml": yaml.safe_dump(phase4_manifests.get("machineConfigPools", {}), sort_keys=True),
         "phase4KubeletConfigs.yaml": yaml.safe_dump(phase4_manifests.get("kubeletConfigs", {}), sort_keys=True),
         "kubeletConfigByTopologyClass.yaml": render_kubelet_config_by_group(topology_groups, phase4),
     }
     upsert_configmap(namespace, f"{name}-computed-cpu-policy", data)
-    logger.info("Reconciled CPUPlacementPolicy %s; nodes=%d groups=%d phase4=%s", name, len(placement_by_node), len(topology_groups), phase4_status)
+
+    # Generic Kubernetes handoff ConfigMap: one kubelet config per node plus an apply plan.
+    generic_cm_data = {f"{node}.kubelet-config.yaml": cfg for node, cfg in generic_kubelet_configs.items()}
+    generic_cm_data["apply-plan.yaml"] = generic_apply_plan
+    upsert_configmap(namespace, output_configmap, generic_cm_data)
+
+    patch_cpu_placement_policy_status(namespace, name, {
+        "provider": provider,
+        "providerStatus": provider_status,
+        "phase4Status": phase4_status,
+        "phase4Error": phase4_error,
+        "observedNodeCount": len(placement_by_node),
+        "observedTopologyGroupCount": len(topology_groups),
+        "computedConfigMap": f"{name}-computed-cpu-policy",
+        "genericOutputConfigMap": output_configmap,
+        "lastReconcileTime": int(time.time()),
+    }, logger=logger)
+
+    logger.info("Reconciled CPUPlacementPolicy %s; provider=%s/%s nodes=%d groups=%d phase4=%s", name, provider.get("type"), provider.get("applyMode"), len(placement_by_node), len(topology_groups), phase4_status)
 
 
 @kopf.on.create(GROUP, VERSION, "nodecputopologies")
 @kopf.on.update(GROUP, VERSION, "nodecputopologies")
-def on_node_topology_change(namespace, logger, **_):
-    logger.info("NodeCPUTopology changed in namespace %s. Re-apply/update CPUPlacementPolicy to recompute immediately.", namespace)
+def on_node_topology_change(namespace, name, logger, **_):
+    policies = list_cpu_placement_policies(namespace)
+    for policy in policies:
+        policy_name = policy.get("metadata", {}).get("name")
+        if not policy_name:
+            continue
+        try:
+            trigger_policy_reconcile(namespace, policy_name, f"topology-{name}")
+        except Exception:
+            logger.exception("Failed to trigger reconcile for CPUPlacementPolicy/%s after NodeCPUTopology/%s changed", policy_name, name)
+    logger.info("NodeCPUTopology/%s changed in namespace %s; triggered %d CPUPlacementPolicy reconcile(s).", name, namespace, len(policies))

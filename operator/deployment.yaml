@@ -16,5 +16,10 @@ spec:
       serviceAccountName: cpu-operator
       containers:
         - name: operator
-          image: image-registry.openshift-image-registry.svc:5000/cpu-operator-images/cpu-operator:dev
+          image: quay.io/louie_tsai/cpu-operator:dev
           imagePullPolicy: Always
+          env:
+            - name: WATCH_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
