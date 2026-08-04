@@ -192,6 +192,88 @@ POLICY=my-cpu-policy ./scripts/generate-vllm-cpu-test-pod.sh
 CM_NAME=my-cpu-policy-computed-cpu-policy ./scripts/generate-vllm-cpu-test-pod.sh
 ```
 
+### Optional: run a real Llama 3.1 8B vLLM serving workload
+
+The lightweight test pod above is the preferred CPU Manager allocation test because it starts quickly and does not depend on model downloads. For an end-to-end inference check, `generate-vllm-cpu-serving-pod.sh` reuses the same policy-derived CPU count and generates:
+
+- one Guaranteed-QoS vLLM CPU pod;
+- one ClusterIP Service on port `8000`;
+- optionally, one OpenShift Route when `EXPOSE_ROUTE=1`.
+
+The default server configuration follows the vLLM CPU serving benchmark for `meta-llama/Llama-3.1-8B-Instruct`: BF16, multiprocessing, block size 128, `max-num-batched-tokens=2048`, `max-num-seqs=256`, and a 40 GiB CPU KV cache. The image defaults to `vllm/vllm-openai-cpu:latest-x86_64`.
+
+The default Llama 3.1 model requires Hugging Face authorization. Create a token secret in the workload namespace first:
+
+```bash
+export HF_TOKEN=<your-hugging-face-token>
+oc create secret generic hf-token \
+  -n default \
+  --from-literal=token="${HF_TOKEN}"
+```
+
+Generate and apply the serving workload:
+
+```bash
+NODE=<worker-node-name> \
+./scripts/generate-vllm-cpu-serving-pod.sh
+
+oc apply -f examples/vllm-cpu-serving.generated.yaml
+oc get pod,svc -n default -l app=vllm-cpu-serving
+oc logs -f vllm-cpu-serving -n default
+```
+
+Useful overrides:
+
+```bash
+NODE=<worker-node-name> \
+TP=2 \
+MEMORY=256Gi \
+IMAGE=vllm/vllm-openai-cpu:latest-x86_64 \
+MODEL=meta-llama/Llama-3.1-8B-Instruct \
+./scripts/generate-vllm-cpu-serving-pod.sh
+```
+
+`VLLM_CPU_OMP_THREADS_BIND=auto` is intentional. The CPU Operator recommends a CPU capacity, while kubelet CPU Manager receives the integer CPU request and chooses the actual exclusive CPU IDs. vLLM should therefore derive its OpenMP binding from the container's effective CPU/NUMA topology rather than binding to the operator's recommended IDs. The generated pod also reserves one CPU per vLLM rank for the serving framework with `VLLM_CPU_NUM_OF_RESERVED_CPU=1`.
+
+The generated Service is cluster-internal. A benchmark or client pod in the cluster can use:
+
+```text
+http://vllm-cpu-serving.default.svc:8000
+```
+
+For an OpenShift cluster with internal ingress that is reachable from a bastion, generate a Route as well:
+
+```bash
+NODE=<worker-node-name> \
+EXPOSE_ROUTE=1 \
+./scripts/generate-vllm-cpu-serving-pod.sh
+
+oc apply -f examples/vllm-cpu-serving.generated.yaml
+ROUTE_HOST="$(oc get route vllm-cpu-serving -n default -o jsonpath='{.spec.host}')"
+curl "http://${ROUTE_HOST}/v1/models"
+```
+
+When no Route is generated, `oc port-forward` is only a temporary bastion-side convenience; it is not required for cluster-internal clients:
+
+```bash
+oc port-forward pod/vllm-cpu-serving -n default 8000:8000
+curl http://127.0.0.1:8000/v1/models
+```
+
+Verify the real serving pod's CPU assignment with the same runtime inspection used for the lightweight pod:
+
+```bash
+LIVE=1 VIEW=both \
+  scripts/show-pod-cpus-grouped.sh "${NODE}" \
+  'vllm-cpu-serving'
+```
+
+Upstream references:
+
+- [vLLM CPU serving benchmark configuration](https://github.com/vllm-project/vllm/blob/main/.buildkite/performance-benchmarks/tests/serving-tests-cpu.json)
+- [vLLM CPU installation and runtime tuning](https://docs.vllm.ai/en/latest/getting_started/installation/cpu/)
+- [Llama 3.1 8B Xeon recipe](https://recipes.vllm.ai/meta-llama/Llama-3.1-8B-Instruct?hardware=xeon6)
+
 ### Interpreting exact CPU IDs
 
 The generated pod requests the same number of CPUs as the recommended `cpuPodCPUSet`. kubelet CPU Manager receives an integer CPU request, not the operator's named CPU pool. Exact IDs can therefore differ while the result is still valid.
