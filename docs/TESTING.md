@@ -253,6 +253,35 @@ ROUTE_HOST="$(oc get route vllm-cpu-serving -n default -o jsonpath='{.spec.host}
 curl "http://${ROUTE_HOST}/v1/models"
 ```
 
+#### Serving access from a bastion
+
+The request path from a bastion-hosted vLLM client to the serving pod is:
+
+```mermaid
+flowchart LR
+    subgraph EXTERNAL["External / Management Network"]
+        CLIENT["Bastion Node<br/>vLLM Client"]
+    end
+
+    subgraph OCP["OpenShift Cluster"]
+        ROUTE["OpenShift Route<br/>vllm-cpu-serving"]
+
+        INGRESS["Ingress Router"]
+
+        SERVICE["Service<br/>vllm-cpu-serving<br/>:8000"]
+
+        POD["vLLM Serving Pod<br/>Llama-3.1-8B<br/>:8000"]
+
+        ROUTE -. "host → service mapping" .-> INGRESS
+        INGRESS --> SERVICE
+        SERVICE --> POD
+    end
+
+    CLIENT -->|"ROUTE_HOST :80"| INGRESS
+```
+
+The Route defines the hostname-to-Service mapping. The client sends traffic to `ROUTE_HOST`; the ingress router applies the Route and forwards the request through the Service to the vLLM serving pod.
+
 When no Route is generated, `oc port-forward` is only a temporary bastion-side convenience; it is not required for cluster-internal clients:
 
 ```bash
