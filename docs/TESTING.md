@@ -274,6 +274,72 @@ Upstream references:
 - [vLLM CPU installation and runtime tuning](https://docs.vllm.ai/en/latest/getting_started/installation/cpu/)
 - [Llama 3.1 8B Xeon recipe](https://recipes.vllm.ai/meta-llama/Llama-3.1-8B-Instruct?hardware=xeon6)
 
+### Transition from the lightweight test pod to real vLLM serving
+
+The lightweight `vllm-cpu-test` pod and the real `vllm-cpu-serving` pod are
+intended to run **sequentially by default**.
+
+Both generators derive their integer CPU request from the policy's
+`cpuPodCPUSet`. When the lightweight test pod is already running and has been
+given the full policy-derived CPU capacity, those CPUs are already committed to
+that Guaranteed-QoS pod. A second serving pod requesting the same capacity can
+therefore remain `Pending` with an `Insufficient cpu` scheduling event.
+
+That condition is expected resource accounting; it does not by itself indicate
+a CPU Operator or CPU Manager failure.
+
+Before replacing the lightweight test pod, capture its final CPU-placement
+result:
+
+```bash
+NODE="$(oc get pod vllm-cpu-test -n default \
+  -o jsonpath='{.spec.nodeName}')"
+
+LIVE=1 VIEW=both \
+  scripts/show-pod-cpus-grouped.sh "${NODE}" \
+  'vllm-cpu-test'
+```
+
+Then delete the lightweight pod and wait until kubelet has released the
+workload:
+
+```bash
+oc delete pod vllm-cpu-test -n default
+
+oc wait --for=delete pod/vllm-cpu-test \
+  -n default \
+  --timeout=120s
+```
+
+Generate and deploy the real vLLM workload on the same worker:
+
+```bash
+NODE="${NODE}" \
+EXPOSE_ROUTE=1 \
+./scripts/generate-vllm-cpu-serving-pod.sh
+
+oc apply -f examples/vllm-cpu-serving.generated.yaml
+oc get pod vllm-cpu-serving -n default -w
+```
+
+The expected test lifecycle is therefore:
+
+```text
+CPU Operator configuration
+  -> vllm-cpu-test
+  -> validate Guaranteed QoS and exclusive CPU assignment
+  -> delete vllm-cpu-test
+  -> vllm-cpu-serving
+  -> validate real Llama 3.1 8B serving and runtime CPU assignment
+```
+
+Running both pods at the same time is valid only when their combined CPU
+requests fit within the node's allocatable CPU capacity and the intended
+exclusive CPU pool. For example, the lightweight pod can be reduced to a small
+integer CPU request while the remaining CPUs are reserved for the real serving
+pod. The default full-capacity generators should instead be treated as
+replacement workloads.
+
 ### Interpreting exact CPU IDs
 
 The generated pod requests the same number of CPUs as the recommended `cpuPodCPUSet`. kubelet CPU Manager receives an integer CPU request, not the operator's named CPU pool. Exact IDs can therefore differ while the result is still valid.
