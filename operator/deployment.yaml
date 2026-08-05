@@ -16,7 +16,7 @@ spec:
       serviceAccountName: cpu-operator
       containers:
         - name: operator
-          image: quay.io/louie_tsai/cpu-operator:dev
+          image: quay.io/louie_tsai/cpu-operator:v1
           imagePullPolicy: Always
           env:
             - name: WATCH_NAMESPACE

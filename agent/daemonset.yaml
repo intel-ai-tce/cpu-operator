@@ -20,7 +20,7 @@ spec:
 
       containers:
         - name: agent
-          image: quay.io/louie_tsai/node-topology-agent:dev
+          image: quay.io/louie_tsai/node-topology-agent:v1
           imagePullPolicy: Always
           env:
             - name: NAMESPACE
