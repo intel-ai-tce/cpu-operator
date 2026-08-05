@@ -195,6 +195,26 @@ validate CPU Manager and workload placement
 
 The operator can compute conceptual pools such as `cpuPodCPUSet`, `gpuPodCPUSet`, and `otherPodsReservedCPUSet`. These values describe policy intent and are useful for rendering configuration, validation, and workload planning.
 
+### Current CPU-count semantics
+
+CPU counts in placement profiles are logical CPUs / Kubernetes vCPUs unless explicitly stated otherwise.
+
+Current `main` defaults are:
+
+```text
+mixed-cpu-amx-gpu:
+  gpuPodReservedCPUs = 24 logical CPUs total
+
+cpu-amx:
+  reservedOtherPodsPerNuma = 1 logical CPU per NUMA node
+```
+
+For `cpu-amx`, the per-NUMA other-pods set becomes `systemReservedCPUSet` and is mapped to kubelet `reservedSystemCPUs`. These CPUs are removed from CPU Manager's exclusive allocation pool.
+
+For `mixed-cpu-amx-gpu`, `gpuPodReservedCPUs` is a GPU-workload placement/capacity target. The computed `gpuPodCPUSet` is intentionally **not** mapped to `reservedSystemCPUs`; GPU workloads still need those CPUs to remain allocatable.
+
+`full-pcpus-only: "true"` affects kubelet's exclusive allocation behavior, but it does not reinterpret `gpuPodReservedCPUs` or `reservedOtherPodsPerNuma` as physical-core counts. On SMT2 systems, two logical CPUs normally correspond to one physical core.
+
 A normal Kubernetes pod, however, requests an integer CPU quantity. kubelet CPU Manager chooses the exact CPU IDs that satisfy its policy and Topology Manager hints. Consequently:
 
 - matching CPU counts with different exact IDs can be valid;

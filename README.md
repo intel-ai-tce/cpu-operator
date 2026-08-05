@@ -211,10 +211,12 @@ The current CRD accepts only `OpenShift` and `GenericKubernetes` provider types,
 
 | Node class | Typical node | Default placement |
 |---|---|---|
-| `mixed-cpu-amx-gpu` | GPU and AMX-capable CPU | Balanced GPU-support CPU pool plus the remaining CPU inference pool. |
-| `cpu-amx` | AMX-capable CPU node without GPU | Balanced per-NUMA reservation for system/shared workloads; remaining CPUs for inference. |
+| `mixed-cpu-amx-gpu` | GPU and AMX-capable CPU | `gpuPodReservedCPUs=24` logical CPUs as a balanced GPU-workload placement/capacity target; remaining CPUs form the CPU inference reference pool. |
+| `cpu-amx` | AMX-capable CPU node without GPU | `reservedOtherPodsPerNuma=1` logical CPU per NUMA for system/shared work, mapped to `reservedSystemCPUs`; remaining CPUs form the CPU inference reference pool. |
 | `gpu-only` | GPU node without required AMX capabilities | Prefer CPU and memory from one NUMA node. |
 | `cpu-only` | General CPU node | Prefer CPU and memory from one NUMA node. |
+
+The placement counts above are logical CPUs / vCPUs, not physical-core counts. `gpuPodReservedCPUs` is not a kubelet system reservation: the mixed-class `gpuPodCPUSet` remains allocatable and is intentionally not mapped to `reservedSystemCPUs`.
 
 The full classification order, placement fields, generated labels, and ConfigMap contract are documented in [Policy Reference](docs/POLICY_REFERENCE.md).
 

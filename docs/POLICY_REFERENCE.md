@@ -2,71 +2,12 @@
 
 This document explains how a `CPUPlacementPolicy` moves through the CPU Operator from user input to node configuration and workload validation.
 
-The sections follow one connected lifecycle:
+The current defaults described here match `operator/operator.py` on `main`:
 
-```mermaid
-flowchart LR
-    subgraph INPUTS["INPUTS"]
-        I1["3. Target node selection<br/><code>spec.targetNodeSelector</code>"]
-        I2["4. Provider selection<br/><code>spec.provider</code>"]
-        I3["5. Classification settings<br/><code>spec.classification</code>"]
-        I4["6. Class profiles and overrides<br/><code>spec.profiles</code>"]
-    end
+- `mixed-cpu-amx-gpu.placement.gpuPodReservedCPUs: 24`
+- `cpu-amx.placement.reservedOtherPodsPerNuma: 1`
 
-    subgraph PROCESSING["PROCESSING"]
-        P1["7. Node classification<br/>Select one node class"]
-        P2["8. Placement calculation<br/>Compute CPU and NUMA intent"]
-        P3["9. Topology grouping<br/>Group compatible nodes"]
-    end
-
-    subgraph OUTPUTS["OUTPUTS"]
-        O1["10. Generated node labels<br/>Expose class and readiness"]
-        O2["11. Provider-specific resources<br/>MCP, KubeletConfig, TuneD,<br/>or generic kubelet config"]
-        O3["12. Computed policy ConfigMaps<br/>Record intermediate and final results"]
-    end
-
-    subgraph CONSUMPTION["CONSUMPTION"]
-        C1["13. Workload eligibility<br/>Guaranteed QoS and node selection"]
-        C2["14. Validation<br/>Verify policy, node, kubelet,<br/>and pod CPU assignment"]
-    end
-
-    L["15. Legacy Phase 4 compatibility<br/><code>spec.phase4</code>"]
-
-    I1 --> P1
-    I3 --> P1
-    I4 --> P1
-    P1 --> P2
-    I4 --> P2
-    P2 --> P3
-
-    P1 --> O1
-    P2 --> O3
-    P3 --> O1
-    P3 --> O2
-    I2 --> O2
-    I2 --> O3
-
-    O1 --> C1
-    O2 --> C1
-    O3 --> C2
-    C1 --> C2
-
-    L -. normalized into provider behavior .-> I2
-```
-
-In plain language:
-
-```text
-Policy inputs
-  -> select target nodes
-  -> classify each node
-  -> choose the class profile
-  -> calculate CPU/NUMA placement
-  -> group nodes with compatible configuration
-  -> generate labels, ConfigMaps, and provider resources
-  -> schedule eligible workloads
-  -> validate the resulting CPU assignment
-```
+> **CPU-count terminology:** unless explicitly stated otherwise, CPU counts in the policy are **logical CPUs / Kubernetes vCPUs**, not physical-core counts. On an SMT2 system, two logical CPUs normally correspond to one physical core.
 
 ---
 
@@ -81,26 +22,28 @@ The operator combines the policy with:
 - optional Node Feature Discovery labels;
 - optional GPU resource and locality information.
 
-The result is not one object. The operator produces several connected outputs:
+The lifecycle is:
 
-1. a selected class for every processed node;
-2. a placement calculation for every processed node;
-3. topology groups containing compatible nodes;
+```text
+Policy inputs
+  -> select target nodes
+  -> classify each node
+  -> choose the class profile
+  -> calculate CPU/NUMA placement
+  -> group nodes with compatible configuration
+  -> generate labels, ConfigMaps, and provider resources
+  -> schedule eligible workloads
+  -> validate the resulting CPU assignment
+```
+
+The operator produces:
+
+1. one selected class for every processed node;
+2. one placement calculation for every processed node;
+3. topology groups containing nodes that need compatible kubelet configuration;
 4. generated node labels;
 5. provider-specific configuration;
 6. computed ConfigMaps for inspection and external consumption.
-
-### Stage dependency summary
-
-| Stage | Consumes | Produces | Used by |
-|---|---|---|---|
-| Node selection | `targetNodeSelector`, Node labels | Selected nodes | Classification |
-| Classification | Selected nodes, topology, classification settings | One class per node | Profile selection and labels |
-| Profile selection | Node class, `spec.profiles` | Effective policy for the class | Placement calculation |
-| Placement | Topology and effective profile | CPU/NUMA placement intent | Topology grouping and ConfigMaps |
-| Topology grouping | Class, topology signature, placement settings | Compatible node groups | OpenShift MCP/KubeletConfig rendering |
-| Provider delivery | Provider type and apply mode | OpenShift resources or generic handoff | Kubelet configuration |
-| Workload consumption | Labels and active kubelet settings | CPU-pinned workload | Validation |
 
 ---
 
@@ -141,7 +84,7 @@ spec:
       topologyManagerPolicy: restricted
       placement:
         strategy: balanced-shared-cpu-and-gpu
-        gpuPodReservedCPUs: 12
+        gpuPodReservedCPUs: 24
         gpuPodDistribution: balanced-across-numa
         cpuPodPool: all-remaining-balanced-across-numa
 
@@ -153,7 +96,7 @@ spec:
       topologyManagerPolicy: restricted
       placement:
         strategy: balanced-reserved-other-pods
-        reservedOtherPodsPerNuma: 2
+        reservedOtherPodsPerNuma: 1
         cpuPodPool: all-remaining-balanced-across-numa
 
     gpu-only:
@@ -180,7 +123,6 @@ spec:
   generic:
     outputConfigMap: auto-vllm-cpu-policy-generated-kubelet-config
 
-  # Backward-compatible OpenShift configuration.
   phase4:
     enabled: true
     apply: true
@@ -189,15 +131,11 @@ spec:
     pauseMachineConfigPool: false
 ```
 
-The following sections explain how these fields move through the lifecycle.
-
 ---
 
 # INPUTS
 
 ## 3. Target node selection
-
-### Input
 
 ```yaml
 spec:
@@ -205,31 +143,13 @@ spec:
     node-role.kubernetes.io/worker: ""
 ```
 
-The operator compares this selector with labels on each Kubernetes Node.
+The operator compares this selector with labels on each Kubernetes Node. An empty string means the label key must exist regardless of value.
 
-An empty string means the label key must exist, regardless of its value.
-
-### Output
-
-A set of worker nodes eligible for policy processing.
-
-```text
-All cluster nodes
-  -> selector matches: continue to classification
-  -> selector does not match: ignore for this policy
-```
-
-### Connection to the next section
-
-Only selected nodes enter **Section 7: Node classification**.
-
-The provider does not decide which nodes are classified. Provider selection only controls how the computed result is delivered.
+Provider selection does not decide which nodes are classified. It only controls how the computed result is delivered.
 
 ---
 
 ## 4. Provider selection
-
-### Input
 
 ```yaml
 spec:
@@ -238,53 +158,18 @@ spec:
     applyMode: Managed
 ```
 
-### Current supported values
-
 | Field | Current values | Meaning |
 |---|---|---|
-| `spec.provider.type` | `OpenShift` | Render OpenShift MachineConfigPool, KubeletConfig, and optional TuneD resources. |
+| `spec.provider.type` | `OpenShift` | Render OpenShift `MachineConfigPool`, `KubeletConfig`, and optional `Tuned` resources. |
 | `spec.provider.type` | `GenericKubernetes` | Render per-node kubelet configuration and an external apply plan. |
 | `spec.provider.applyMode` | `Managed` | Apply supported provider resources. Currently meaningful for OpenShift. |
 | `spec.provider.applyMode` | `RecommendationOnly` | Render outputs without applying node configuration. |
 
-`Kubeadm`, `ClusterAPI`, `ExternalApply`, and `NodeAgent` are design concepts for future backends or apply paths. They are not current CRD enum values.
-
-### Output
-
-A normalized provider decision:
-
-```yaml
-type: OpenShift
-applyMode: Managed
-```
-
 The normalized provider is written to `provider.yaml` in the computed policy ConfigMap.
-
-### Connection to later sections
-
-Provider selection does not change node classification or CPU placement.
-
-It controls **Section 11: Provider-specific resources**:
-
-```text
-OpenShift + Managed
-  -> render and apply MCP/KubeletConfig
-  -> optionally render and apply TuneD
-
-OpenShift + RecommendationOnly
-  -> render OpenShift objects
-  -> do not apply them
-
-GenericKubernetes + RecommendationOnly
-  -> render per-node KubeletConfiguration
-  -> render an external apply plan
-```
 
 ---
 
 ## 5. Classification settings
-
-### Input
 
 ```yaml
 spec:
@@ -297,48 +182,20 @@ spec:
     cpuAmxMinLogicalCPUs: 64
 ```
 
-### Field meanings
-
 | Field | Purpose |
 |---|---|
 | `overrideLabel` | Allows a valid manual node-class request through a Node label. |
 | `amxNodeSelector` | Explicitly identifies AMX-capable nodes intended for CPU inference. |
-| `gpuOnlyNodeSelector` | Forces matching GPU nodes into the `gpu-only` class. |
+| `gpuOnlyNodeSelector` | Forces matching GPU nodes into `gpu-only`. |
 | `cpuAmxMinLogicalCPUs` | Allows large AMX nodes to qualify for `cpu-amx` without an explicit selector. |
 
 A manual override requesting an AMX class is rejected if AMX BF16 or AMX INT8 is missing.
 
-### Output
-
-Classification criteria used in **Section 7**.
-
-These settings do not directly generate CPU sets.
-
-### Connection to the next section
-
-The selected class determines which profile in **Section 6** becomes effective.
-
 ---
 
-## 6. Class profiles and overrides
+## 6. Class profiles and CPU-count semantics
 
-### Input
-
-```yaml
-spec:
-  profiles:
-    cpu-amx:
-      cpuManagerPolicy: static
-      cpuManagerPolicyOptions:
-        distribute-cpus-across-numa: "true"
-        full-pcpus-only: "true"
-      topologyManagerPolicy: restricted
-      placement:
-        strategy: balanced-reserved-other-pods
-        reservedOtherPodsPerNuma: 2
-```
-
-Each node class has one profile.
+Each node class has one profile. The selected class determines which profile is passed into placement calculation.
 
 ### Supported node classes
 
@@ -349,30 +206,110 @@ Each node class has one profile.
 | `gpu-only` | GPU node that does not qualify for the mixed AMX class |
 | `cpu-only` | General CPU node that does not qualify for `cpu-amx` |
 
-### Profile fields
+### Important unit rule
 
-| Field | Consumed by |
-|---|---|
-| `cpuManagerPolicy` | Generated kubelet configuration |
-| `cpuManagerPolicyOptions` | Generated kubelet configuration and topology signature |
-| `topologyManagerPolicy` | Generated kubelet configuration |
-| `placement.strategy` | Placement calculation |
-| `gpuPodReservedCPUs` | Mixed CPU/GPU placement |
-| `reservedOtherPodsPerNuma` | AMX CPU placement |
-| `cpuPodPool` | Placement description and output |
+The fields below are expressed in **logical CPUs / vCPUs**:
 
-### Output
+- `gpuPodReservedCPUs`
+- `reservedOtherPodsPerNuma`
+- generated `gpuPodCPUSet`
+- generated `cpuPodCPUSet`
+- generated `otherPodsReservedCPUSet`
+- generated `systemReservedCPUSet`
 
-An effective profile for the class selected in **Section 7**.
+`full-pcpus-only: "true"` does **not** change these fields into physical-core counts. It changes how kubelet CPU Manager satisfies an eligible pod's exclusive integer CPU request: on an SMT system, CPU Manager allocates complete physical cores rather than splitting sibling threads when the request can be admitted.
 
-### Connection to processing
+### `cpu-amx`: `reservedOtherPodsPerNuma`
+
+Current default:
+
+```yaml
+cpu-amx:
+  placement:
+    strategy: balanced-reserved-other-pods
+    reservedOtherPodsPerNuma: 1
+```
+
+`reservedOtherPodsPerNuma` means **logical CPUs reserved per NUMA node**.
+
+For example, on a two-NUMA node:
 
 ```text
-Node classification
-  -> selected node class
-  -> profile for that class
-  -> placement calculation
+reservedOtherPodsPerNuma = 1 logical CPU
+NUMA nodes               = 2
+--------------------------------
+planned reserved set      = 2 logical CPUs total
 ```
+
+The operator calculates `otherPodsReservedCPUSet`, copies that value to `systemReservedCPUSet`, and for `cpu-amx` maps it to kubelet `reservedSystemCPUs`.
+
+Therefore the `cpu-amx` reservation is a **real kubelet system/shared reservation**. Those CPUs are removed from CPU Manager's exclusive allocation pool.
+
+Example on a 96-logical-CPU, two-NUMA worker:
+
+```text
+Capacity                     96 logical CPUs
+reservedOtherPodsPerNuma      1
+NUMA nodes                    2
+reservedSystemCPUs            2 logical CPUs
+exclusive-capable maximum    94 logical CPUs
+```
+
+The scheduler must also have enough allocatable headroom for existing pod requests. For example, if the node reports 94 allocatable CPUs and existing OpenShift pods request about 0.7 CPU, a 92-CPU Guaranteed vLLM pod can fit scheduler accounting while remaining below the CPU Manager exclusive-capacity limit.
+
+After that 92-CPU exclusive allocation, the CPU Manager default/shared pool can contain four logical CPUs:
+
+```text
+2 explicitly reserved system/shared CPUs
++ 2 exclusive-capable CPUs not allocated to vLLM
+= 4 CPUs visible in the default/shared pool
+```
+
+This distinction matters: **shared-pool size is not always equal to `reservedSystemCPUs` size**.
+
+### `mixed-cpu-amx-gpu`: `gpuPodReservedCPUs`
+
+Current default:
+
+```yaml
+mixed-cpu-amx-gpu:
+  placement:
+    strategy: balanced-shared-cpu-and-gpu
+    gpuPodReservedCPUs: 24
+    gpuPodDistribution: balanced-across-numa
+```
+
+`gpuPodReservedCPUs: 24` means **24 logical CPUs / vCPUs total**, balanced across NUMA nodes by the placement calculation.
+
+For a two-NUMA node, the policy intent is approximately:
+
+```text
+24 logical CPUs total
+  -> about 12 logical CPUs from NUMA 0
+  -> about 12 logical CPUs from NUMA 1
+```
+
+On SMT2 hardware, 24 logical CPUs correspond to about 12 physical cores when allocated as complete cores.
+
+Despite the field name, these GPU-support CPUs are **not** mapped to kubelet `reservedSystemCPUs`.
+
+The operator deliberately leaves:
+
+```yaml
+systemReservedCPUSet: ""
+```
+
+for the mixed class because GPU workloads may still need those CPUs to remain allocatable for exclusive CPU Manager assignment. Mapping `gpuPodCPUSet` into `reservedSystemCPUs` would remove them from the exclusive allocation pool for all pods and defeat the GPU-workload use case.
+
+### Reserved CPU vs GPU vCPU summary
+
+| Setting/output | Class | Unit | Becomes `reservedSystemCPUs`? | Meaning |
+|---|---|---:|---|---|
+| `reservedOtherPodsPerNuma` | `cpu-amx` | logical CPUs per NUMA | **Yes, indirectly** | System/shared reservation for non-exclusive work. |
+| `otherPodsReservedCPUSet` | `cpu-amx` | logical CPU IDs | **Yes** | Exact computed set mapped to kubelet reservation. |
+| `gpuPodReservedCPUs` | `mixed-cpu-amx-gpu` | logical CPUs total | **No** | GPU-workload CPU capacity/placement intent. |
+| `gpuPodCPUSet` | `mixed-cpu-amx-gpu` | logical CPU IDs | **No** | Reference set for GPU-support CPU placement. |
+| `cpuPodCPUSet` | mixed or CPU class | logical CPU IDs | No direct named-pool enforcement | Policy capacity/reference set for CPU workloads. |
 
 ---
 
@@ -401,32 +338,13 @@ The operator evaluates each selected node using:
 | 6 | No GPU, AMX supported, and logical CPU count meets the minimum | `cpu-amx` |
 | 7 | No earlier rule matches | `cpu-only` |
 
-### Output
-
-One class and classification reason per node.
-
-Example:
-
-```yaml
-worker-0:
-  class: mixed-cpu-amx-gpu
-  reason:
-    gpuCount: 8
-    logicalCPUs: 344
-    amx:
-      amx_bf16: true
-      amx_int8: true
-```
-
-### Connection to the next section
-
-The class selects an effective profile, which is passed with node topology to **Section 8: Placement calculation**.
+The GPU count is derived from Kubernetes/NFD/GPU Operator signals and placement-grade PCI discovery from `NodeCPUTopology`.
 
 ---
 
 ## 8. Placement calculation
 
-Placement calculation combines:
+Placement combines:
 
 ```text
 NodeCPUTopology
@@ -444,90 +362,53 @@ NodeCPUTopology
 | `gpu-only` | `same-numa-node-first` | `numaLocalCPUSetByNuma`, `preferredNumaNode` |
 | `cpu-only` | `same-numa-node-first` | `numaLocalCPUSetByNuma`, `preferredNumaNode` |
 
-Example mixed-node result:
+### Mixed CPU/GPU placement
 
-```yaml
-strategy: balanced-shared-cpu-and-gpu
-gpuPodCPUSet: 0-2,43-45,86-88,129-131
-cpuPodCPUSet: 3-42,46-85,89-128,132-171
-cpuManagerPolicy: static
-topologyManagerPolicy: restricted
-```
+For `mixed-cpu-amx-gpu`, the operator:
 
-### Important limitation
+1. selects `gpuPodReservedCPUs` logical CPUs balanced across NUMA;
+2. records them as `gpuPodCPUSet`;
+3. records the remaining CPUs as `cpuPodCPUSet`;
+4. leaves `systemReservedCPUSet` empty.
 
-`gpuPodCPUSet` and `cpuPodCPUSet` describe placement intent.
+The resulting named sets describe **placement intent and policy capacity**. Standard kubelet CPU Manager does not understand an operator-defined "GPU CPU pool" or "CPU pod pool" by name.
 
-Kubelet CPU Manager normally receives an integer CPU request and chooses exact logical CPU IDs. It does not independently understand the operator's conceptual CPU-pod and GPU-pod pools.
+A Guaranteed GPU pod still requests an integer CPU quantity. CPU Manager chooses exact logical CPU IDs according to CPU Manager and Topology Manager policy. Exact IDs can therefore differ from the operator's reference `gpuPodCPUSet` unless an additional enforcement mechanism is introduced.
 
-### `reservedSystemCPUs`
+### CPU AMX placement
 
-For `cpu-amx`, the balanced other-pods set can become `reservedSystemCPUs`.
+For `cpu-amx`, the operator:
 
-For `mixed-cpu-amx-gpu`, the GPU-support CPU set must not automatically become `reservedSystemCPUs`, because that would remove those CPUs from kubelet's exclusive allocation pool.
+1. chooses `reservedOtherPodsPerNuma` logical CPUs from each NUMA node;
+2. combines them into `otherPodsReservedCPUSet`;
+3. removes those IDs from `cpuPodCPUSet`;
+4. sets `systemReservedCPUSet` to the same other-pods set;
+5. maps that set to kubelet `reservedSystemCPUs` during provider rendering.
 
-### Output
+### Why GPU CPUs are not system-reserved
 
-Per-node placement data written to:
+Do not map `gpuPodCPUSet` to `reservedSystemCPUs`.
 
-```text
-cpuPlacementByNode.yaml
-```
-
-### Connection to the next section
-
-The class, topology shape, placement strategy, GPU-local NUMA information, and CPU Manager options form a topology signature used by **Section 9**.
+`reservedSystemCPUs` means CPUs reserved for OS/system/shared work and removed from the exclusive CPU Manager allocation pool. GPU workloads need their CPU capacity to remain allocatable, so mixed-class GPU CPU intent and system reservation are intentionally separate concepts.
 
 ---
 
 ## 9. Topology grouping
 
-OpenShift `KubeletConfig` applies to a `MachineConfigPool`, not independently to each node.
+OpenShift `KubeletConfig` applies to a `MachineConfigPool`, not independently to each node. The operator therefore groups nodes that require compatible configuration.
 
-The operator therefore groups nodes that need compatible configuration.
-
-```mermaid
-flowchart LR
-    N1["Node A<br/>cpu-amx<br/>4 NUMA nodes"] --> G["Topology group<br/>cpu-amx-a1b2c3d4"]
-    N2["Node B<br/>cpu-amx<br/>4 NUMA nodes"] --> G
-    N3["Node C<br/>cpu-amx<br/>2 NUMA nodes"] --> G2["Different topology group"]
-```
-
-### Topology signature inputs
-
-The grouping signature includes:
+Topology signature inputs include:
 
 - node class;
 - CPUs per NUMA node;
 - GPU-local NUMA nodes;
 - AMX support;
 - placement strategy;
-- CPU reservation settings;
+- `gpuPodReservedCPUs`;
+- `reservedOtherPodsPerNuma`;
 - CPU Manager policy options.
 
-### Output
-
-A stable topology-group name and a group record:
-
-```yaml
-cpu-amx-a1b2c3d4:
-  nodeClass: cpu-amx
-  cpuManagerPolicy: static
-  topologyManagerPolicy: restricted
-  placementStrategy: balanced-reserved-other-pods
-  nodes:
-    - worker-0
-    - worker-1
-```
-
-### Connection to outputs
-
-Topology groups drive:
-
-- the `cpu.example.com/topology-group` node label;
-- one OpenShift `MachineConfigPool` per group;
-- one OpenShift `KubeletConfig` per group;
-- topology-group information in computed ConfigMaps.
+Changing either reservation setting can therefore produce a new topology-group hash and corresponding MCP/KubeletConfig names.
 
 ---
 
@@ -535,324 +416,214 @@ Topology groups drive:
 
 ## 10. Generated node labels
 
-Generated labels expose processing results on each Node.
-
-| Label suffix | Source stage | Purpose |
-|---|---|---|
-| `topology-ready` | Topology discovery | Topology was available and processed |
-| `node-class` | Classification | Selected node class |
-| `topology-group` | Topology grouping | Compatible configuration group |
-| `placement-strategy` | Placement | Selected strategy |
-| `gpu-count` | Hardware discovery | Detected GPU count |
-| `gpu-local-numa` | Hardware discovery | GPU-local NUMA nodes |
-| `amx-supported` | Hardware discovery | Both AMX BF16 and INT8 are available |
-| `placement-ready` | Placement | Placement was calculated |
-| `phase4-applied` | Provider delivery | OpenShift managed apply succeeded |
-
-Example:
+Typical labels include:
 
 ```text
 cpu.example.com/topology-ready=true
 cpu.example.com/node-class=cpu-amx
-cpu.example.com/topology-group=cpu-amx-a1b2c3d4
+cpu.example.com/topology-group=cpu-amx-<hash>
 cpu.example.com/placement-strategy=balanced-reserved-other-pods
+cpu.example.com/gpu-count=0
+cpu.example.com/gpu-local-numa=none
 cpu.example.com/amx-supported=true
+cpu.example.com/amx-bf16=true
+cpu.example.com/amx-int8=true
+cpu.example.com/placement-ready=true
 cpu.example.com/phase4-applied=true
 ```
 
-### Connection to consumption
-
-Workloads can use these labels in `nodeSelector` or node affinity.
+These labels expose computed state. They do not independently enforce a CPU set.
 
 ---
 
 ## 11. Provider-specific resources
 
-Provider selection from **Section 4** determines how the processing results are delivered.
+### OpenShift
 
-### OpenShift provider
-
-```mermaid
-flowchart LR
-    G["Topology group"] --> MCP["MachineConfigPool"]
-    G --> KC["KubeletConfig"]
-    MCP --> MCO["Machine Config Operator"]
-    KC --> MCO
-    MCO --> K["Worker kubelet configuration"]
-    K --> W["CPU-pinned workloads"]
-```
-
-For each topology group, the operator renders:
+For each topology group, the operator can generate:
 
 - one `MachineConfigPool`;
 - one `KubeletConfig`;
-- optionally one `Tuned` resource for the configured tuning profile.
+- optional `Tuned` configuration.
 
-`Managed` applies the supported resources.
+For `cpu-amx`, a consistent `systemReservedCPUSet` across the topology group becomes:
 
-`RecommendationOnly` records the rendered resources without applying them.
-
-### Generic Kubernetes provider
-
-```mermaid
-flowchart LR
-    G["Per-node placement"] --> KCFG["Per-node KubeletConfiguration"]
-    KCFG --> CM["Generated ConfigMap"]
-    CM --> PLAN["External apply plan"]
-    PLAN --> EXT["kubeadm, Cluster API,<br/>or external automation"]
-    EXT --> K["Worker kubelet configuration"]
+```yaml
+spec:
+  kubeletConfig:
+    reservedSystemCPUs: <computed CPU IDs>
 ```
 
-Generic Kubernetes has no upstream equivalent of OpenShift MachineConfigPool and Machine Config Operator.
+For `mixed-cpu-amx-gpu`, `gpuPodCPUSet` is intentionally **not** written into `reservedSystemCPUs`.
 
-The operator therefore produces:
+### Generic Kubernetes
 
-- one `<node>.kubelet-config.yaml` entry per processed node;
-- `apply-plan.yaml`;
-- a ConfigMap containing those artifacts.
-
-### Output
-
-Provider-specific resources and status:
-
-```text
-providerStatus
-phase4Status
-phase4MachineConfigPools.yaml
-phase4KubeletConfigs.yaml
-openshiftTuned.yaml
-genericKubeletConfigs.yaml
-genericApplyPlan.yaml
-```
+The operator renders per-node `KubeletConfiguration` data plus an external apply plan. Host mutation remains the responsibility of kubeadm, Cluster API, configuration management, or other automation.
 
 ---
 
 ## 12. Computed policy ConfigMaps
 
-The computed policy ConfigMap is the main audit record.
-
-Default name:
+The main computed ConfigMap is:
 
 ```text
 <policy-name>-computed-cpu-policy
 ```
 
-### Intermediate outputs
-
-| Key | Stage |
-|---|---|
-| `provider.yaml` | Provider normalization |
-| `targetNodeSelector.yaml` | Target selection |
-| `nodeClassification.yaml` | Classification |
-| `cpuPlacementByNode.yaml` | Placement calculation |
-| `topologyGroups.yaml` | Topology grouping |
-| `generatedNodeLabels.yaml` | Label generation |
-
-### Final provider outputs
-
-| Key | Purpose |
-|---|---|
-| `providerStatus` | Provider reconciliation result |
-| `phase4Status` | OpenShift generation/apply result |
-| `phase4Error` | OpenShift apply error |
-| `phase4MachineConfigPools.yaml` | Rendered MCP resources |
-| `phase4KubeletConfigs.yaml` | Rendered KubeletConfig resources |
-| `openshiftTuned.yaml` | Rendered TuneD resource |
-| `genericKubeletConfigs.yaml` | Per-node generic kubelet configurations |
-| `genericApplyPlan.yaml` | Safe external apply sequence |
-
-A separate generic handoff ConfigMap contains:
+Important keys include:
 
 ```text
-<node-name>.kubelet-config.yaml
-apply-plan.yaml
+provider.yaml
+nodeClassification.yaml
+cpuPlacementByNode.yaml
+topologyGroups.yaml
+generatedNodeLabels.yaml
+reservedSystemCPUsByNode.yaml
+genericKubeletConfigs.yaml
+genericApplyPlan.yaml
+phase4MachineConfigPools.yaml
+phase4KubeletConfigs.yaml
 ```
 
-### Connection to validation
+`cpuPlacementByNode.yaml` is the best place to inspect the distinction between:
 
-The computed ConfigMaps let users inspect every transition in the lifecycle without inferring results from pod behavior alone.
+- `gpuPodCPUSet`;
+- `cpuPodCPUSet`;
+- `otherPodsReservedCPUSet`;
+- `systemReservedCPUSet`.
 
 ---
 
 # CONSUMPTION
 
-## 13. Workload eligibility
+## 13. Workload eligibility and CPU capacity
 
-A workload consumes two outputs from the earlier stages:
+Exclusive CPU Manager allocation requires an eligible Guaranteed-QoS workload with integer CPU request equal to CPU limit.
 
-1. generated node labels for scheduling;
-2. active kubelet CPU Manager and Topology Manager configuration.
-
-### Node selection
-
-```yaml
-nodeSelector:
-  cpu.example.com/topology-ready: "true"
-  cpu.example.com/node-class: cpu-amx
-```
-
-### Guaranteed QoS
-
-For exclusive CPU Manager allocation, use integer and equal CPU requests and limits.
+Example:
 
 ```yaml
 resources:
   requests:
-    cpu: "8"
-    memory: "16Gi"
+    cpu: "92"
+    memory: "256Gi"
   limits:
-    cpu: "8"
-    memory: "16Gi"
+    cpu: "92"
+    memory: "256Gi"
 ```
 
-The pod must be recreated after the kubelet policy becomes active. An existing pod is not retroactively reassigned.
-
-### Runtime result
+Two independent limits must be satisfied:
 
 ```text
-Eligible workload
-  + matching node label
-  + CPU Manager static policy
-  + integer CPU request
-  = exclusive CPU assignment
+Scheduler constraint:
+workload CPU request + existing pod CPU requests
+<= Node Allocatable CPU
+
+CPU Manager constraint:
+workload exclusive CPU request
+<= logical CPUs not removed by reservedSystemCPUs
 ```
+
+The policy's `cpuPodCPUSet` represents policy CPU capacity/reference data. A workload may request less than that capacity. The generator scripts support `CPU_REQUEST=<n>` for this reason.
+
+### Shared pool versus reserved CPUs
+
+Do not assume:
+
+```text
+shared pool size == reservedSystemCPUs size
+```
+
+With static CPU Manager, the default/shared pool also contains exclusive-capable CPUs that have not currently been assigned to Guaranteed integer-CPU workloads.
+
+Example:
+
+```text
+96 logical CPUs total
+2 reservedSystemCPUs
+92 CPUs assigned exclusively to vLLM
+------------------------------------
+4 CPUs remain in default/shared pool
+```
+
+Only two of those four are explicitly system-reserved; the other two are simply unallocated.
 
 ---
 
 ## 14. Validation
 
-Validate in lifecycle order rather than starting with the pod.
-
-```mermaid
-flowchart LR
-    V1["1. Operator and agent pods"] --> V2["2. NodeCPUTopology"]
-    V2 --> V3["3. Node classification"]
-    V3 --> V4["4. Placement output"]
-    V4 --> V5["5. Topology group and labels"]
-    V5 --> V6["6. Provider resources"]
-    V6 --> V7["7. Kubelet CPU Manager state"]
-    V7 --> V8["8. Workload cpuset"]
-```
-
-### Validate operator outputs for one real worker
+Validate control-plane output first:
 
 ```bash
-scripts/test-worker-node-output.sh <worker-node-name>
+NODE=<worker-node-name>
+scripts/test-worker-node-output.sh "${NODE}"
 ```
 
-The script:
-
-1. confirms the node is a worker;
-2. reads its generated class;
-3. applies only assertions for that class;
-4. verifies placement and labels;
-5. verifies provider status and generated resources;
-6. prints `[PASS]` or `[FAIL]`;
-7. exits nonzero when any assertion fails.
-
-### Test all class contracts without a cluster
+Inspect the live kubelet configuration:
 
 ```bash
-python3 scripts/test-node-class-outputs.py
+oc debug "node/${NODE}" --quiet -- chroot /host sh -c '
+  grep -E "cpuManagerPolicy|topologyManagerPolicy|reservedSystemCPUs" \
+    /etc/kubernetes/kubelet.conf 2>/dev/null || true
+  cat /var/lib/kubelet/cpu_manager_state
+'
 ```
 
-Expected summary:
-
-```text
-[PASS] mixed-cpu-amx-gpu
-[PASS] cpu-amx
-[PASS] gpu-only
-[PASS] cpu-only
-[PASS] summary: 4/4 node classes passed
-```
-
-### Inspect the policy pipeline
+Inspect scheduler accounting:
 
 ```bash
-examples/check_cpu_operator_io.sh
+oc get node "${NODE}" \
+  -o jsonpath='capacity={.status.capacity.cpu}{"\n"}allocatable={.status.allocatable.cpu}{"\n"}'
+
+oc describe node "${NODE}" | \
+  sed -n '/Allocated resources:/,/Events:/p'
 ```
 
-### Verify workload CPU assignment
+Inspect runtime shared/exclusive CPU sets:
 
 ```bash
-grep Cpus_allowed_list /proc/self/status
-cat /sys/fs/cgroup/cpuset.cpus.effective 2>/dev/null || true
+LIVE=1 VIEW=both \
+  scripts/show-pod-cpus-grouped.sh "${NODE}"
 ```
 
-For privileged or host-integrated containers, `/sys/fs/cgroup` may expose a broader host cgroup level. The process-level `Cpus_allowed_list` is the primary live affinity check.
+A CPU set is an allowed execution boundary; it does not mean every container is actively consuming every CPU in the set.
 
 ---
 
 ## 15. Legacy Phase 4 compatibility
 
-`spec.phase4` is the original OpenShift-only configuration path.
+The current provider model supersedes the original OpenShift-only Phase 4 design, but `spec.phase4` remains for backward compatibility.
 
-It is retained for backward compatibility.
-
-```mermaid
-flowchart LR
-    OLD["Legacy policy<br/><code>spec.phase4</code>"] --> N["Provider normalization"]
-    NEW["New policy<br/><code>spec.provider</code><br/><code>spec.openshift</code>"] --> N
-    N --> E["Effective OpenShift Phase 4 settings"]
-    E --> MCP["MachineConfigPool"]
-    E --> KC["KubeletConfig"]
-    E --> T["Optional TuneD"]
-```
-
-### Legacy policy
-
-```yaml
-spec:
-  phase4:
-    enabled: true
-    apply: true
-```
-
-When `spec.provider` is absent, the operator infers:
-
-```yaml
-provider:
-  type: OpenShift
-  applyMode: Managed
-```
-
-When `phase4.apply` is false, the inferred apply mode is `RecommendationOnly`.
-
-When neither `provider` nor `phase4` is present, the operator defaults to generic recommendation-only behavior.
-
-### New policy
-
-```yaml
-spec:
-  provider:
-    type: OpenShift
-    applyMode: Managed
-
-  openshift:
-    machineConfigPoolNamePrefix: cpu
-    topologyManagerScope: pod
-```
-
-### Recommendation
-
-Use `spec.provider` and provider-specific sections for new policies.
-
-Keep `spec.phase4` only when compatibility with the existing OpenShift implementation is required. When both forms appear, keep equivalent settings consistent to avoid ambiguous configuration.
+For OpenShift, provider normalization can still use Phase 4 fields to determine managed apply behavior, MCP naming, topology-manager scope, and pause behavior.
 
 ---
 
-## Complete relationship summary
+# Final implementation notes
+
+The current `main` policy intentionally separates two concepts that use similar words but have different enforcement semantics:
 
 ```text
-Policy input
-  -> chooses nodes
-  -> classifies hardware
-  -> selects the class profile
-  -> computes CPU and NUMA placement
-  -> groups compatible nodes
-  -> generates node labels
-  -> renders or applies provider resources
-  -> records all decisions in ConfigMaps
-  -> enables eligible workloads
-  -> validates kubelet and pod CPU assignment
+cpu-amx
+  reservedOtherPodsPerNuma
+      -> logical CPU IDs selected per NUMA
+      -> otherPodsReservedCPUSet
+      -> systemReservedCPUSet
+      -> kubelet reservedSystemCPUs
+      -> removed from exclusive CPU Manager capacity
+
+mixed-cpu-amx-gpu
+  gpuPodReservedCPUs
+      -> logical CPU count for GPU-workload placement/capacity intent
+      -> gpuPodCPUSet balanced across NUMA
+      -> NOT reservedSystemCPUs
+      -> remains available for pod CPU requests
 ```
+
+Current defaults:
+
+```text
+mixed-cpu-amx-gpu: gpuPodReservedCPUs = 24 logical CPUs total
+cpu-amx:           reservedOtherPodsPerNuma = 1 logical CPU per NUMA
+```
+
+These values are defaults and can be overridden in `spec.profiles` when a platform needs different capacity or reservation sizing.
