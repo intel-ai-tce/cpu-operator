@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Generate a vLLM CPU test pod whose CPU request/limit is derived from the
-# current computed CPUPlacementPolicy output ConfigMap.
+# Generate a vLLM CPU test pod using the current computed CPUPlacementPolicy.
+# cpuPodCPUSet defines the policy CPU capacity. The workload may request any
+# positive integer CPU count up to that capacity; when CPU_REQUEST is omitted,
+# the generator uses the full policy capacity for backward compatibility.
 #
 # Required tools: oc, python3
 # Optional environment overrides:
@@ -14,6 +16,7 @@ set -euo pipefail
 #   POD_NAME        Generated pod name
 #   IMAGE           Test container image
 #   MEMORY          Memory request/limit for the test pod
+#   CPU_REQUEST     Requested exclusive CPUs; defaults to full policy capacity
 #   OUT             Output manifest path
 
 NAMESPACE="${NAMESPACE:-cpu-operator-system}"
@@ -24,6 +27,7 @@ POD_NAMESPACE="${POD_NAMESPACE:-default}"
 POD_NAME="${POD_NAME:-vllm-cpu-test}"
 IMAGE="${IMAGE:-registry.access.redhat.com/ubi9/ubi}"
 MEMORY="${MEMORY:-256Gi}"
+CPU_REQUEST="${CPU_REQUEST:-}"
 OUT="${OUT:-examples/vllm-cpu-test-pod.generated.yaml}"
 
 fail() { echo "[FAIL] $*" >&2; exit 1; }
@@ -128,7 +132,7 @@ phase4_applied = extract_scalar(labels_text, node, "cpu.example.com/phase4-appli
 
 print(f"NODE={node}")
 print(f"CPUSET={cpu_set}")
-print(f"CPU_COUNT={cpu_count}")
+print(f"CPU_CAPACITY={cpu_count}")
 print(f"NODE_CLASS={node_class}")
 print(f"TOPOLOGY_GROUP={topology_group}")
 print(f"PLACEMENT_STRATEGY={placement_strategy}")
@@ -139,8 +143,22 @@ PY
 # shellcheck disable=SC1090
 source <(printf '%s\n' "${PY_OUT}")
 
-if [[ -z "${CPUSET:-}" || -z "${CPU_COUNT:-}" ]]; then
-  fail "Failed to derive CPUSET/CPU_COUNT from ${CM_NAME}"
+if [[ -z "${CPUSET:-}" || -z "${CPU_CAPACITY:-}" ]]; then
+  fail "Failed to derive CPUSET/CPU_CAPACITY from ${CM_NAME}"
+fi
+
+[[ "${CPU_CAPACITY}" =~ ^[1-9][0-9]*$ ]] \
+  || fail "Derived CPU_CAPACITY=${CPU_CAPACITY} is not a positive integer"
+
+if [[ -z "${CPU_REQUEST}" ]]; then
+  CPU_REQUEST="${CPU_CAPACITY}"
+fi
+
+[[ "${CPU_REQUEST}" =~ ^[1-9][0-9]*$ ]] \
+  || fail "CPU_REQUEST must be a positive integer"
+
+if (( CPU_REQUEST > CPU_CAPACITY )); then
+  fail "CPU_REQUEST=${CPU_REQUEST} exceeds policy CPU capacity=${CPU_CAPACITY}"
 fi
 
 mkdir -p "$(dirname "${OUT}")"
@@ -213,7 +231,8 @@ cat >> "${OUT}" <<EOF_MANIFEST
           }
 
           POLICY_CPUSET="${CPUSET}"
-          EXPECTED_CPU_COUNT="${CPU_COUNT}"
+          POLICY_CPU_CAPACITY="${CPU_CAPACITY}"
+          REQUESTED_CPU_COUNT="${CPU_REQUEST}"
           ACTUAL_CPUSET="\$(awk '/^Cpus_allowed_list:/ {print \$2}' /proc/self/status)"
           EFFECTIVE_CPUSET="\$(cat /sys/fs/cgroup/cpuset.cpus.effective 2>/dev/null || cat /sys/fs/cgroup/cpuset/cpuset.cpus 2>/dev/null || true)"
           ACTUAL_CPU_COUNT="\$(count_cpuset "\${ACTUAL_CPUSET}")"
@@ -222,7 +241,8 @@ cat >> "${OUT}" <<EOF_MANIFEST
           echo "Node: \${NODE_NAME}"
           echo "Policy: ${POLICY}"
           echo "Policy-recommended CPU set: \${POLICY_CPUSET}"
-          echo "Policy-required CPU count: \${EXPECTED_CPU_COUNT}"
+          echo "Policy CPU capacity: \${POLICY_CPU_CAPACITY}"
+          echo "Pod requested CPU count: \${REQUESTED_CPU_COUNT}"
           echo "Expected node class: ${NODE_CLASS:-unknown}"
           echo "Expected topology group: ${TOPOLOGY_GROUP:-unknown}"
           echo "Expected placement strategy: ${PLACEMENT_STRATEGY:-unknown}"
@@ -234,18 +254,26 @@ cat >> "${OUT}" <<EOF_MANIFEST
           echo "Actual exclusive CPU count: \${ACTUAL_CPU_COUNT}"
           echo
 
-          if [[ "\${ACTUAL_CPU_COUNT}" -eq "\${EXPECTED_CPU_COUNT}" ]]; then
-            echo "[PASS] CPU count: expected=\${EXPECTED_CPU_COUNT} actual=\${ACTUAL_CPU_COUNT}"
+          if (( REQUESTED_CPU_COUNT <= POLICY_CPU_CAPACITY )); then
+            echo "[PASS] CPU request within policy capacity: requested=\${REQUESTED_CPU_COUNT} capacity=\${POLICY_CPU_CAPACITY}"
           else
-            echo "[FAIL] CPU count: expected=\${EXPECTED_CPU_COUNT} actual=\${ACTUAL_CPU_COUNT}"
+            echo "[FAIL] CPU request exceeds policy capacity: requested=\${REQUESTED_CPU_COUNT} capacity=\${POLICY_CPU_CAPACITY}"
             exit 1
           fi
 
-          if [[ "\${ACTUAL_CPUSET}" == "\${POLICY_CPUSET}" ]]; then
+          if [[ "\${ACTUAL_CPU_COUNT}" -eq "\${REQUESTED_CPU_COUNT}" ]]; then
+            echo "[PASS] CPU count: requested=\${REQUESTED_CPU_COUNT} actual=\${ACTUAL_CPU_COUNT}"
+          else
+            echo "[FAIL] CPU count: requested=\${REQUESTED_CPU_COUNT} actual=\${ACTUAL_CPU_COUNT}"
+            exit 1
+          fi
+
+          if [[ "\${REQUESTED_CPU_COUNT}" -eq "\${POLICY_CPU_CAPACITY}" && "\${ACTUAL_CPUSET}" == "\${POLICY_CPUSET}" ]]; then
             echo "[PASS] Exact CPU IDs match the policy recommendation"
           else
             echo "[INFO] Exact CPU IDs differ from the policy recommendation"
-            echo "[INFO] This is valid when kubelet CPU Manager receives only an integer CPU request."
+            echo "[INFO] This is valid because cpuPodCPUSet is a capacity/reference set;"
+            echo "[INFO] kubelet CPU Manager receives only the integer workload CPU request."
             echo "[INFO] Validate CPU count, NUMA distribution, full-core allocation, and checkpoint state."
           fi
 
@@ -272,17 +300,20 @@ cat >> "${OUT}" <<EOF_MANIFEST
           value: "120"
       resources:
         requests:
-          cpu: "${CPU_COUNT}"
+          cpu: "${CPU_REQUEST}"
           memory: "${MEMORY}"
         limits:
-          cpu: "${CPU_COUNT}"
+          cpu: "${CPU_REQUEST}"
           memory: "${MEMORY}"
 EOF_MANIFEST
 
 info "Generated ${OUT}"
 echo "NODE=${NODE}"
 echo "CPUSET=${CPUSET}"
-echo "CPU_COUNT=${CPU_COUNT}"
+echo "CPU_CAPACITY=${CPU_CAPACITY}"
+echo "CPU_REQUEST=${CPU_REQUEST}"
+# Backward-compatible alias. With no override this remains equal to capacity.
+echo "CPU_COUNT=${CPU_REQUEST}"
 echo "NODE_CLASS=${NODE_CLASS:-}"
 echo "TOPOLOGY_GROUP=${TOPOLOGY_GROUP:-}"
 echo

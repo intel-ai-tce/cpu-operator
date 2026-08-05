@@ -2,12 +2,12 @@
 set -euo pipefail
 
 # Generate a real vLLM CPU serving Pod and ClusterIP Service whose Guaranteed
-# QoS CPU request/limit is derived from the CPU Operator computed placement.
+# QoS CPU request/limit is bounded by the CPU Operator computed placement.
 # Optionally append an OpenShift Route for access from a bastion/VPC client.
 #
 # This script intentionally reuses generate-vllm-cpu-test-pod.sh to resolve the
-# selected node and CPU count so both workload generators follow identical CPU
-# Operator placement semantics.
+# selected node, policy capacity, and requested CPU count so both workload
+# generators follow identical CPU Operator placement semantics.
 #
 # Required tools: oc, python3 (used by generate-vllm-cpu-test-pod.sh)
 #
@@ -22,6 +22,7 @@ set -euo pipefail
 #   IMAGE                  vLLM CPU serving image
 #   MODEL                  Hugging Face model ID
 #   MEMORY                 Pod memory request/limit
+#   CPU_REQUEST            Requested exclusive CPUs; defaults to policy capacity
 #   TP                     vLLM tensor-parallel size
 #   PORT                   vLLM HTTP port
 #   HF_TOKEN_SECRET        Secret containing the Hugging Face token; empty omits it
@@ -44,6 +45,7 @@ SERVICE_NAME="${SERVICE_NAME:-${POD_NAME}}"
 IMAGE="${IMAGE:-vllm/vllm-openai-cpu:latest-x86_64}"
 MODEL="${MODEL:-meta-llama/Llama-3.1-8B-Instruct}"
 MEMORY="${MEMORY:-256Gi}"
+CPU_REQUEST="${CPU_REQUEST:-}"
 TP="${TP:-1}"
 PORT="${PORT:-8000}"
 HF_TOKEN_SECRET="${HF_TOKEN_SECRET-hf-token}"
@@ -75,6 +77,7 @@ GEN_OUTPUT="$({
   NODE="${NODE}" \
   POD_NAMESPACE="${POD_NAMESPACE}" \
   POD_NAME="${POD_NAME}-placement-resolver" \
+  CPU_REQUEST="${CPU_REQUEST}" \
   OUT="${BASE_OUT}" \
   bash "${BASE_GENERATOR}"
 } 2>&1)" || {
@@ -84,23 +87,37 @@ GEN_OUTPUT="$({
 
 RESOLVED_NODE=""
 CPUSET=""
-CPU_COUNT=""
+CPU_CAPACITY=""
+RESOLVED_CPU_REQUEST=""
+CPU_COUNT_COMPAT=""
 NODE_CLASS=""
 TOPOLOGY_GROUP=""
 while IFS='=' read -r key value; do
   case "${key}" in
     NODE) RESOLVED_NODE="${value}" ;;
     CPUSET) CPUSET="${value}" ;;
-    CPU_COUNT) CPU_COUNT="${value}" ;;
+    CPU_CAPACITY) CPU_CAPACITY="${value}" ;;
+    CPU_REQUEST) RESOLVED_CPU_REQUEST="${value}" ;;
+    CPU_COUNT) CPU_COUNT_COMPAT="${value}" ;;
     NODE_CLASS) NODE_CLASS="${value}" ;;
     TOPOLOGY_GROUP) TOPOLOGY_GROUP="${value}" ;;
   esac
 done <<< "${GEN_OUTPUT}"
 
 [[ -n "${RESOLVED_NODE}" ]] || fail "Could not resolve target node"
-[[ "${CPU_COUNT}" =~ ^[1-9][0-9]*$ ]] || fail "Could not resolve CPU count"
-if (( CPU_COUNT <= TP )); then
-  fail "CPU_COUNT=${CPU_COUNT} must be greater than TP=${TP} when reserving one CPU per vLLM rank"
+[[ "${CPU_CAPACITY}" =~ ^[1-9][0-9]*$ ]] || fail "Could not resolve policy CPU capacity"
+
+if [[ -z "${RESOLVED_CPU_REQUEST}" ]]; then
+  RESOLVED_CPU_REQUEST="${CPU_COUNT_COMPAT}"
+fi
+[[ "${RESOLVED_CPU_REQUEST}" =~ ^[1-9][0-9]*$ ]] || fail "Could not resolve workload CPU request"
+
+if (( RESOLVED_CPU_REQUEST > CPU_CAPACITY )); then
+  fail "CPU request=${RESOLVED_CPU_REQUEST} exceeds policy CPU capacity=${CPU_CAPACITY}"
+fi
+
+if (( RESOLVED_CPU_REQUEST <= TP )); then
+  fail "CPU_REQUEST=${RESOLVED_CPU_REQUEST} must be greater than TP=${TP} when reserving one CPU per vLLM rank"
 fi
 
 if [[ -n "${HF_TOKEN_SECRET}" ]]; then
@@ -207,10 +224,10 @@ cat >> "${OUT}" <<EOF_MANIFEST
           protocol: TCP
       resources:
         requests:
-          cpu: "${CPU_COUNT}"
+          cpu: "${RESOLVED_CPU_REQUEST}"
           memory: "${MEMORY}"
         limits:
-          cpu: "${CPU_COUNT}"
+          cpu: "${RESOLVED_CPU_REQUEST}"
           memory: "${MEMORY}"
       volumeMounts:
         - name: shm
@@ -261,7 +278,10 @@ fi
 info "Generated ${OUT}"
 echo "NODE=${RESOLVED_NODE}"
 echo "CPUSET=${CPUSET}"
-echo "CPU_COUNT=${CPU_COUNT}"
+echo "CPU_CAPACITY=${CPU_CAPACITY}"
+echo "CPU_REQUEST=${RESOLVED_CPU_REQUEST}"
+# Backward-compatible alias for callers that still consume CPU_COUNT.
+echo "CPU_COUNT=${RESOLVED_CPU_REQUEST}"
 echo "NODE_CLASS=${NODE_CLASS}"
 echo "TOPOLOGY_GROUP=${TOPOLOGY_GROUP}"
 echo "MODEL=${MODEL}"

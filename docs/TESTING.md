@@ -164,7 +164,10 @@ Do not interpret workload CPU placement until the node is Ready and its target M
 
 This test reads computed placement capacity and verifies that an eligible workload receives an exclusive CPU Manager allocation.
 
-The generator reads `cpuPodCPUSet` from the computed policy, counts its logical CPUs, and creates a pod with matching integer CPU request and limit:
+The generator reads `cpuPodCPUSet` from the computed policy and treats its
+logical-CPU count as the **policy CPU capacity**. The workload may request any
+positive integer CPU count up to that capacity. If `CPU_REQUEST` is omitted,
+the generator requests the full capacity for backward compatibility:
 
 ```bash
 ./scripts/generate-vllm-cpu-test-pod.sh
@@ -174,6 +177,17 @@ oc get pod vllm-cpu-test -n default -o wide
 oc logs vllm-cpu-test -n default
 ```
 
+For example, if the computed `cpuPodCPUSet` contains 84 logical CPUs, request
+only 60 exclusive CPUs with:
+
+```bash
+NODE=<worker-node-name> \
+CPU_REQUEST=60 \
+./scripts/generate-vllm-cpu-test-pod.sh
+```
+
+The generated pod remains Guaranteed QoS because CPU request equals CPU limit.
+
 Useful overrides:
 
 ```bash
@@ -182,6 +196,7 @@ POD_NAMESPACE=default \
 POD_NAME=vllm-cpu-test \
 IMAGE=registry.access.redhat.com/ubi9/ubi \
 MEMORY=256Gi \
+CPU_REQUEST=60 \
 ./scripts/generate-vllm-cpu-test-pod.sh
 ```
 
@@ -194,7 +209,7 @@ CM_NAME=my-cpu-policy-computed-cpu-policy ./scripts/generate-vllm-cpu-test-pod.s
 
 ### Optional: run a real Llama 3.1 8B vLLM serving workload
 
-The lightweight test pod above is the preferred CPU Manager allocation test because it starts quickly and does not depend on model downloads. For an end-to-end inference check, `generate-vllm-cpu-serving-pod.sh` reuses the same policy-derived CPU count and generates:
+The lightweight test pod above is the preferred CPU Manager allocation test because it starts quickly and does not depend on model downloads. For an end-to-end inference check, `generate-vllm-cpu-serving-pod.sh` reuses the same policy-derived CPU capacity and `CPU_REQUEST` semantics and generates:
 
 - one Guaranteed-QoS vLLM CPU pod;
 - one ClusterIP Service on port `8000`;
@@ -227,6 +242,7 @@ Useful overrides:
 ```bash
 NODE=<worker-node-name> \
 TP=2 \
+CPU_REQUEST=60 \
 MEMORY=256Gi \
 IMAGE=vllm/vllm-openai-cpu:latest-x86_64 \
 MODEL=meta-llama/Llama-3.1-8B-Instruct \
@@ -308,10 +324,12 @@ Upstream references:
 The lightweight `vllm-cpu-test` pod and the real `vllm-cpu-serving` pod are
 intended to run **sequentially by default**.
 
-Both generators derive their integer CPU request from the policy's
-`cpuPodCPUSet`. When the lightweight test pod is already running and has been
-given the full policy-derived CPU capacity, those CPUs are already committed to
-that Guaranteed-QoS pod. A second serving pod requesting the same capacity can
+Both generators derive the maximum allowed CPU count from the policy's
+`cpuPodCPUSet`. By default they request that full capacity, preserving the
+original behavior. `CPU_REQUEST` can be used to generate a smaller workload.
+When the lightweight test pod is already running and has been given the full
+policy-derived CPU capacity, those CPUs are already committed to that
+Guaranteed-QoS pod. A second serving pod requesting the same capacity can
 therefore remain `Pending` with an `Insufficient cpu` scheduling event.
 
 That condition is expected resource accounting; it does not by itself indicate
@@ -365,16 +383,20 @@ CPU Operator configuration
 Running both pods at the same time is valid only when their combined CPU
 requests fit within the node's allocatable CPU capacity and the intended
 exclusive CPU pool. For example, the lightweight pod can be reduced to a small
-integer CPU request while the remaining CPUs are reserved for the real serving
-pod. The default full-capacity generators should instead be treated as
-replacement workloads.
+integer CPU request with `CPU_REQUEST=<n>` while the remaining CPUs are
+available for the real serving pod. The default full-capacity generators should
+instead be treated as replacement workloads.
 
 ### Interpreting exact CPU IDs
 
-The generated pod requests the same number of CPUs as the recommended `cpuPodCPUSet`. kubelet CPU Manager receives an integer CPU request, not the operator's named CPU pool. Exact IDs can therefore differ while the result is still valid.
+`cpuPodCPUSet` represents the policy's CPU capacity/reference set. The generated
+pod requests `CPU_REQUEST` CPUs, which may be less than that capacity. kubelet
+CPU Manager receives the integer CPU request, not the operator's named CPU
+pool. Exact IDs can therefore differ while the result is still valid.
 
 Treat an exact-ID difference as informational when all of the following are true:
 
+- the requested CPU count does not exceed the policy CPU capacity;
 - the assigned CPU count equals the requested count;
 - CPU Manager records an exclusive assignment for the container;
 - exclusive and shared CPU sets do not overlap;
