@@ -345,7 +345,7 @@ def profile_for_class(spec: Dict, node_class: str) -> Dict:
         "mixed-cpu-amx-gpu": {
             "placement": {
                 "strategy": "balanced-shared-cpu-and-gpu",
-                "gpuPodReservedCPUs": 12,
+                "gpuPodReservedCPUs": 24,
                 "gpuPodDistribution": "balanced-across-numa",
                 "cpuPodPool": "all-remaining-balanced-across-numa",
             },
@@ -359,7 +359,7 @@ def profile_for_class(spec: Dict, node_class: str) -> Dict:
         "cpu-amx": {
             "placement": {
                 "strategy": "balanced-reserved-other-pods",
-                "reservedOtherPodsPerNuma": 2,
+                "reservedOtherPodsPerNuma": 1,
                 "cpuPodPool": "all-remaining-balanced-across-numa",
             },
             "cpuManagerPolicy": "static",
