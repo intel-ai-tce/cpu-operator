@@ -37,7 +37,7 @@ rules:
   - apiGroups: ["cpu.example.com"]
     resources:
       - nodecputopologies
-    verbs: ["get", "list", "watch"]
+    verbs: ["get", "list", "watch", "patch"]
   - apiGroups: ["cpu.example.com"]
     resources:
       - cpuplacementpolicies
@@ -46,6 +46,16 @@ rules:
     resources:
       - cpuplacementpolicies/status
     verbs: ["get", "patch", "update"]
+
+  # Kopf namespace discovery/watch.
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get", "list", "watch"]
+
+  # Kopf CRD discovery for custom resources.
+  - apiGroups: ["apiextensions.k8s.io"]
+    resources: ["customresourcedefinitions"]
+    verbs: ["get", "list", "watch"]
 
   - apiGroups: [""]
     resources: ["nodes"]
