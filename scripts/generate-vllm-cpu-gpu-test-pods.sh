@@ -9,10 +9,12 @@ set -euo pipefail
 #   * CPU pod CPU request = cpuPodCPUSet capacity
 #                           - (CPU_HEADROOM_PER_NUMA * NUMA_COUNT).
 #
-# For the current AWS g7.12xlarge example:
+# Example sizing:
 #   gpuPodCPUSet=0-11   -> GPU_CPU_REQUEST=12
 #   cpuPodCPUSet=12-47  -> CPU_CAPACITY=36
-#   NUMA_COUNT=2        -> CPU_REQUEST=36-(1*2)=34
+#   CPU policy target   -> 36-(1*NUMA_COUNT)
+# The default CPU request is additionally capped to live scheduler capacity
+# after existing pod CPU requests and the paired GPU test are accounted for.
 #
 # The policy CPU sets are capacity/reference sets. Kubernetes CPU Manager gets
 # integer CPU requests and may choose different exact CPU IDs.
@@ -77,6 +79,7 @@ CPU_PLACEMENT_FILE="${WORKDIR}/cpuPlacementByNode.yaml"
 NODE_LABELS_FILE="${WORKDIR}/generatedNodeLabels.yaml"
 TOPOLOGY_JSON="${WORKDIR}/nodecputopologies.json"
 NODE_JSON="${WORKDIR}/node.json"
+PODS_JSON="${WORKDIR}/pods-on-node.json"
 
 info "Reading computed placement from ConfigMap ${NAMESPACE}/${CM_NAME}"
 oc get cm "${CM_NAME}" -n "${NAMESPACE}" \
@@ -105,24 +108,30 @@ fi
 
 oc get node "${NODE}" -o json > "${NODE_JSON}"
 oc get nodecputopologies.cpu.example.com -n "${NAMESPACE}" -o json > "${TOPOLOGY_JSON}"
+oc get pods -A --field-selector "spec.nodeName=${NODE}" -o json > "${PODS_JSON}"
 
 PY_OUT="$(python3 - \
   "${CPU_PLACEMENT_FILE}" \
   "${NODE_LABELS_FILE}" \
   "${TOPOLOGY_JSON}" \
   "${NODE_JSON}" \
-  "${NODE}" <<'PY'
+  "${PODS_JSON}" \
+  "${NODE}" \
+  "${POD_NAMESPACE}" \
+  "${CPU_POD_NAME}" \
+  "${GPU_POD_NAME}" <<'PY'
 import json
 import re
 import shlex
 import sys
 from pathlib import Path
 
-placement_path, labels_path, topology_path, node_path, node = sys.argv[1:]
+placement_path, labels_path, topology_path, node_path, pods_path, node, pod_namespace, cpu_pod_name, gpu_pod_name = sys.argv[1:]
 placement_text = Path(placement_path).read_text(encoding="utf-8")
 labels_text = Path(labels_path).read_text(encoding="utf-8") if Path(labels_path).exists() else ""
 topologies = json.load(open(topology_path, encoding="utf-8"))
 node_json = json.load(open(node_path, encoding="utf-8"))
+pods_json = json.load(open(pods_path, encoding="utf-8"))
 
 
 def extract_scalar(text, node_name, key):
@@ -222,6 +231,36 @@ alloc_cpu_raw = alloc.get("cpu", "0")
 alloc_cpu_m = cpu_quantity_to_millicores(alloc_cpu_raw)
 alloc_gpu = int(alloc.get("nvidia.com/gpu", 0) or 0)
 
+# Scheduler capacity is allocatable minus CPU requests from pods already bound
+# to this node. Exclude the generated test pod names so rerunning the generator
+# while one of the tests is alive does not double-count that test request.
+def container_cpu_request_m(container):
+    requests = ((container.get("resources") or {}).get("requests") or {})
+    return cpu_quantity_to_millicores(requests.get("cpu", "0"))
+
+existing_cpu_request_m = 0
+existing_request_pods = []
+for pod in pods_json.get("items", []):
+    meta = pod.get("metadata") or {}
+    spec = pod.get("spec") or {}
+    status_obj = pod.get("status") or {}
+    if status_obj.get("phase") in {"Succeeded", "Failed"}:
+        continue
+    if meta.get("namespace") == pod_namespace and meta.get("name") in {cpu_pod_name, gpu_pod_name}:
+        continue
+
+    # Summing app + init requests is intentionally conservative. It may
+    # slightly overestimate transient init-container demand, which is safer for
+    # a stress-test generator than producing another unschedulable manifest.
+    pod_request_m = sum(container_cpu_request_m(c) for c in (spec.get("containers") or []))
+    pod_request_m += sum(container_cpu_request_m(c) for c in (spec.get("initContainers") or []))
+    pod_request_m += cpu_quantity_to_millicores((spec.get("overhead") or {}).get("cpu", "0"))
+    existing_cpu_request_m += pod_request_m
+    if pod_request_m:
+        existing_request_pods.append(
+            f"{meta.get('namespace','default')}/{meta.get('name','?')}={pod_request_m}m"
+        )
+
 values = {
     "NODE": node,
     "CPUSET": cpu_set,
@@ -239,6 +278,8 @@ values = {
     "NODE_ALLOCATABLE_CPU": alloc_cpu_raw,
     "NODE_ALLOCATABLE_CPU_M": alloc_cpu_m,
     "NODE_ALLOCATABLE_GPU": alloc_gpu,
+    "EXISTING_NODE_CPU_REQUEST_M": existing_cpu_request_m,
+    "EXISTING_NODE_CPU_REQUEST_PODS": ",".join(existing_request_pods),
 }
 for key, value in values.items():
     print(f"{key}={shlex.quote(str(value))}")
@@ -264,12 +305,31 @@ if (( GPU_CPU_REQUEST > GPU_CPU_CAPACITY )); then
 fi
 
 CPU_HEADROOM_TOTAL=$((CPU_HEADROOM_PER_NUMA * NUMA_COUNT))
+CPU_POLICY_TARGET=$((CPU_CAPACITY - CPU_HEADROOM_TOTAL))
+(( CPU_POLICY_TARGET > 0 )) \
+  || fail "CPU policy target is not positive: capacity=${CPU_CAPACITY} headroom=${CPU_HEADROOM_TOTAL}"
+
+# Keep the requested policy rule as the target, but do not generate a CPU pod
+# that the Kubernetes scheduler can never place because other pods already
+# consume part of node allocatable CPU. GPU_CPU_REQUEST is always reserved from
+# the scheduler budget because the paired test is intended to run concurrently.
+SCHEDULER_CPU_BUDGET_M=$((NODE_ALLOCATABLE_CPU_M - EXISTING_NODE_CPU_REQUEST_M - GPU_CPU_REQUEST * 1000))
+SCHEDULER_CPU_CAP=$((SCHEDULER_CPU_BUDGET_M / 1000))
+
 if [[ -z "${CPU_REQUEST}" ]]; then
-  CPU_REQUEST=$((CPU_CAPACITY - CPU_HEADROOM_TOTAL))
+  CPU_REQUEST="${CPU_POLICY_TARGET}"
+  if (( CPU_REQUEST > SCHEDULER_CPU_CAP )); then
+    warn "CPU policy target=${CPU_POLICY_TARGET} cannot co-schedule with the GPU test and existing pod requests"
+    warn "Reducing CPU request to scheduler-safe cap=${SCHEDULER_CPU_CAP}"
+    CPU_REQUEST="${SCHEDULER_CPU_CAP}"
+  fi
 fi
 [[ "${CPU_REQUEST}" =~ ^[1-9][0-9]*$ ]] || fail "CPU_REQUEST must be a positive integer"
 if (( CPU_REQUEST > CPU_CAPACITY )); then
   fail "CPU_REQUEST=${CPU_REQUEST} exceeds cpuPodCPUSet capacity=${CPU_CAPACITY}"
+fi
+if (( CPU_REQUEST > SCHEDULER_CPU_CAP )); then
+  fail "CPU_REQUEST=${CPU_REQUEST} exceeds scheduler-safe cap=${SCHEDULER_CPU_CAP} after existing node requests and GPU test demand"
 fi
 
 if (( THREADS_PER_CORE > 1 )); then
@@ -296,16 +356,20 @@ echo "THREADS_PER_CORE=${THREADS_PER_CORE}"
 echo "GPU_LOCAL_NUMA_NODES=${GPU_LOCAL_NUMA_NODES:-unknown}"
 echo "NODE_ALLOCATABLE_CPU=${NODE_ALLOCATABLE_CPU}"
 echo "NODE_ALLOCATABLE_GPU=${NODE_ALLOCATABLE_GPU}"
+echo "EXISTING_NODE_CPU_REQUEST=${EXISTING_NODE_CPU_REQUEST_M}m"
+if [[ -n "${EXISTING_NODE_CPU_REQUEST_PODS:-}" ]]; then
+  echo "EXISTING_NODE_CPU_REQUEST_PODS=${EXISTING_NODE_CPU_REQUEST_PODS}"
+fi
 echo
 echo "GPU policy: cpuset=${GPU_CPUSET} capacity=${GPU_CPU_CAPACITY} request=${GPU_CPU_REQUEST} gpu=${GPU_REQUEST}"
-echo "CPU policy: cpuset=${CPUSET} capacity=${CPU_CAPACITY} headroom=${CPU_HEADROOM_PER_NUMA}x${NUMA_COUNT}=${CPU_HEADROOM_TOTAL} request=${CPU_REQUEST}"
+echo "CPU policy: cpuset=${CPUSET} capacity=${CPU_CAPACITY} headroom=${CPU_HEADROOM_PER_NUMA}x${NUMA_COUNT}=${CPU_HEADROOM_TOTAL} policyTarget=${CPU_POLICY_TARGET} schedulerCap=${SCHEDULER_CPU_CAP} request=${CPU_REQUEST}"
 echo "Combined exclusive CPU request=${COMBINED_CPU_REQUEST}"
 
 if (( COMBINED_CPU_REQUEST_M == NODE_ALLOCATABLE_CPU_M )); then
   warn "Combined test request consumes all node allocatable CPU; existing pod requests can make scheduling fail"
 else
-  HEADROOM_M=$((NODE_ALLOCATABLE_CPU_M - COMBINED_CPU_REQUEST_M))
-  info "Allocatable CPU headroom after these two test requests: ${HEADROOM_M}m"
+  HEADROOM_M=$((NODE_ALLOCATABLE_CPU_M - EXISTING_NODE_CPU_REQUEST_M - COMBINED_CPU_REQUEST_M))
+  info "Scheduler CPU headroom after existing pod requests plus these two tests: ${HEADROOM_M}m"
 fi
 info "Existing pods on the node also consume scheduler CPU requests; inspect 'oc describe node ${NODE}' if either pod remains Pending"
 
