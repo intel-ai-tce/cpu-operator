@@ -181,21 +181,44 @@ oc debug "node/${NODE}" --quiet -- \
   cat /var/lib/kubelet/cpu_manager_state
 ```
 
-Generate and deploy a Guaranteed-QoS CPU test pod:
+For a CPU-only allocation test, generate the existing Guaranteed-QoS CPU pod:
 
 ```bash
+NODE="${NODE}" \
+CPU_REQUEST=<integer-cpu-count> \
+MEMORY=1Gi \
 ./scripts/generate-vllm-cpu-test-pod.sh
+
 oc apply -f examples/vllm-cpu-test-pod.generated.yaml
 ```
 
-Compare kubelet CPU Manager assignments with live process affinity across the worker:
+For a `mixed-cpu-amx-gpu` worker, the preferred runtime test is the paired generator. It creates one Guaranteed-QoS GPU pod and one Guaranteed-QoS CPU pod from the computed policy while accounting for live scheduler CPU capacity:
+
+```bash
+NODE="${NODE}" \
+./scripts/generate-vllm-cpu-gpu-test-pods.sh
+
+# Admit the GPU+CPU topology request first, then fill the remaining CPU capacity.
+oc apply -f examples/vllm-gpu-test-pod.generated.yaml
+oc wait --for=condition=Ready pod/vllm-gpu-test -n default --timeout=120s
+
+oc apply -f examples/vllm-cpu-test-pod.generated.yaml
+oc wait --for=condition=Ready pod/vllm-cpu-test -n default --timeout=120s
+```
+
+The paired generator defaults the GPU pod to the full `gpuPodReservedCPUs` capacity. Its CPU policy target is `cpuPodCPUSet capacity - (CPU_HEADROOM_PER_NUMA × NUMA_COUNT)`, then it caps that target to the largest whole-CPU request that can co-schedule after existing pod CPU requests and the paired GPU request are accounted for.
+
+Compare kubelet CPU Manager assignments with live process affinity across both workloads:
 
 ```bash
 LIVE=1 VIEW=both \
-  scripts/show-pod-cpus-grouped.sh "${NODE}"
+  scripts/show-pod-cpus-grouped.sh "${NODE}" \
+  'vllm-cpu-test|vllm-gpu-test'
 ```
 
-A shared CPU set is an allowed scheduling boundary, not evidence that every pod is actively consuming every CPU. See [Testing and Validation](docs/TESTING.md) for the lifecycle mapping, expected results, and failure localization.
+A successful paired test requires both pods to be Guaranteed QoS, both to receive the requested exclusive CPU counts, no overlap between their exclusive assignments, and `manager=live` affinity for each container. Exact CPU IDs may differ from `gpuPodCPUSet` and `cpuPodCPUSet` because those fields are policy capacity/reference sets; kubelet CPU Manager receives integer CPU requests rather than named pools.
+
+A shared CPU set is an allowed scheduling boundary, not evidence that every pod is actively consuming every CPU. See [Testing and Validation](docs/TESTING.md) for sizing rules, a real mixed-worker example, expected results, and failure localization.
 
 ## Provider modes
 

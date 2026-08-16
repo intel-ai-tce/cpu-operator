@@ -26,7 +26,7 @@ flowchart TB
         direction LR
         T1["1. test-worker-node-output.sh<br/>Real-worker output validation"]
         T2["2. Kubelet state inspection<br/>Provider-to-node boundary"]
-        T3["3. generate-vllm-cpu-test-pod.sh<br/>Eligible workload test"]
+        T3["3. workload test generator<br/>CPU-only or paired CPU/GPU Guaranteed QoS"]
         T4["4. show-pod-cpus-grouped.sh<br/>Runtime CPU-map validation"]
     end
 
@@ -60,7 +60,7 @@ For example:
 
 - `test-worker-node-output.sh` validates the real worker through the provider-output stage but does not create a workload.
 - Kubelet state inspection confirms the generated provider configuration became active on the worker.
-- `generate-vllm-cpu-test-pod.sh` verifies that a Guaranteed-QoS pod receives exclusive CPUs.
+- `generate-vllm-cpu-test-pod.sh` verifies a single Guaranteed-QoS CPU workload, while `generate-vllm-cpu-gpu-test-pods.sh` validates concurrent Guaranteed-QoS CPU and GPU workloads on `mixed-cpu-amx-gpu` nodes.
 - `show-pod-cpus-grouped.sh` provides the final node-wide runtime view.
 
 ## Lifecycle coverage matrix
@@ -158,16 +158,15 @@ oc get node "${NODE}"
 
 Do not interpret workload CPU placement until the node is Ready and its target MCP is Updated.
 
-## 3. Generate a Guaranteed-QoS CPU test pod
+## 3. Generate Guaranteed-QoS workload test pods
 
 **Lifecycle coverage:** OUTPUTS → CONSUMPTION.
 
-This test reads computed placement capacity and verifies that an eligible workload receives an exclusive CPU Manager allocation.
+Use the CPU-only generator for a single eligible workload, or use the paired generator on a `mixed-cpu-amx-gpu` node to validate CPU and GPU workloads concurrently.
 
-The generator reads `cpuPodCPUSet` from the computed policy and treats its
-logical-CPU count as the **policy CPU capacity**. The workload may request any
-positive integer CPU count up to that capacity. If `CPU_REQUEST` is omitted,
-the generator requests the full capacity for backward compatibility:
+### 3.1 CPU-only Guaranteed-QoS test
+
+The CPU-only generator reads `cpuPodCPUSet` from the computed policy and treats its logical-CPU count as the **policy CPU capacity**. The workload may request any positive integer CPU count up to that capacity. If `CPU_REQUEST` is omitted, the generator requests the full capacity for backward compatibility:
 
 ```bash
 ./scripts/generate-vllm-cpu-test-pod.sh
@@ -177,8 +176,7 @@ oc get pod vllm-cpu-test -n default -o wide
 oc logs vllm-cpu-test -n default
 ```
 
-For example, if the computed `cpuPodCPUSet` contains 84 logical CPUs, request
-only 60 exclusive CPUs with:
+For example, if the computed `cpuPodCPUSet` contains 84 logical CPUs, request only 60 exclusive CPUs with:
 
 ```bash
 NODE=<worker-node-name> \
@@ -195,7 +193,7 @@ NODE=<worker-node-name> \
 POD_NAMESPACE=default \
 POD_NAME=vllm-cpu-test \
 IMAGE=registry.access.redhat.com/ubi9/ubi \
-MEMORY=256Gi \
+MEMORY=1Gi \
 CPU_REQUEST=60 \
 ./scripts/generate-vllm-cpu-test-pod.sh
 ```
@@ -206,6 +204,124 @@ Use another policy or ConfigMap:
 POLICY=my-cpu-policy ./scripts/generate-vllm-cpu-test-pod.sh
 CM_NAME=my-cpu-policy-computed-cpu-policy ./scripts/generate-vllm-cpu-test-pod.sh
 ```
+
+### 3.2 Paired CPU + GPU Guaranteed-QoS test for mixed workers
+
+For `mixed-cpu-amx-gpu`, use `generate-vllm-cpu-gpu-test-pods.sh` to generate two lightweight pods that are intended to run at the same time:
+
+- `vllm-gpu-test`: requests a GPU plus exclusive CPUs;
+- `vllm-cpu-test`: requests the remaining scheduler-safe exclusive CPU capacity selected by the test policy.
+
+The paired generator reads the computed placement, `NodeCPUTopology`, live node allocatable resources, and CPU requests from pods already bound to the worker. Its default sizing is:
+
+```text
+GPU_CPU_REQUEST = gpuPodReservedCPUs
+
+CPU_POLICY_TARGET =
+    cpuPodCPUSet capacity
+    - (CPU_HEADROOM_PER_NUMA × NUMA_COUNT)
+
+SCHEDULER_CPU_CAP = floor(
+    (node allocatable millicores
+     - existing pod CPU requests
+     - GPU_CPU_REQUEST × 1000)
+    / 1000
+)
+
+CPU_REQUEST = min(CPU_POLICY_TARGET, SCHEDULER_CPU_CAP)
+```
+
+`CPU_HEADROOM_PER_NUMA` defaults to `1`. Existing generated test pod names are excluded from the existing-request calculation, so the generator can be rerun while one of the paired tests is already alive without double-counting that test. When `full-pcpus-only=true` and SMT is present, the generator also checks that integer requests align with the detected threads-per-core value.
+
+Generate both manifests:
+
+```bash
+NODE=<worker-node-name> \
+./scripts/generate-vllm-cpu-gpu-test-pods.sh
+```
+
+The generated files are:
+
+```text
+examples/vllm-gpu-test-pod.generated.yaml
+examples/vllm-cpu-test-pod.generated.yaml
+```
+
+Apply the GPU pod first so Topology Manager and the device manager admit the GPU+CPU request before the CPU workload fills the remaining exclusive capacity:
+
+```bash
+oc apply -f examples/vllm-gpu-test-pod.generated.yaml
+oc wait --for=condition=Ready \
+  pod/vllm-gpu-test -n default --timeout=120s
+
+oc apply -f examples/vllm-cpu-test-pod.generated.yaml
+oc wait --for=condition=Ready \
+  pod/vllm-cpu-test -n default --timeout=120s
+```
+
+Then validate both at once:
+
+```bash
+LIVE=1 VIEW=both \
+  scripts/show-pod-cpus-grouped.sh "${NODE}" \
+  'vllm-cpu-test|vllm-gpu-test'
+```
+
+A paired runtime PASS requires:
+
+```text
+[PASS] GPU pod is Guaranteed QoS and receives GPU_CPU_REQUEST exclusive CPUs
+[PASS] CPU pod is Guaranteed QoS and receives CPU_REQUEST exclusive CPUs
+[PASS] GPU and CPU exclusive CPU sets do not overlap
+[PASS] CPU Manager checkpoint equals live process affinity for both containers
+[PASS] requested GPU resources are admitted and the GPU pod is Running
+```
+
+#### Worked mixed-worker example
+
+One real mixed-worker validation produced this computed policy:
+
+```text
+gpuPodCPUSet: 0-11      # capacity 12
+cpuPodCPUSet: 12-47     # capacity 36
+gpuPodReservedCPUs: 12
+```
+
+The node exposed one NUMA node and `47.5` allocatable CPUs. The CPU policy target was therefore `36 - (1 × 1) = 35`, but the first `12 + 35` attempt was `Pending` with `Insufficient cpu` because existing pod requests consumed more than the remaining `0.5` CPU. Reducing/capping the CPU test to `34` allowed both workloads to run concurrently.
+
+The runtime report was:
+
+```text
+GPU pod: request=12  manager=1-12   live=1-12
+CPU pod: request=34  manager=13-46  live=13-46
+```
+
+This is a valid PASS even though the actual CPU IDs differ from the policy reference sets. The important properties are the requested exclusive CPU counts, no overlap, and exact manager/live agreement.
+
+### 3.3 Policy/reference CPU sets versus actual kubelet IDs
+
+For both mixed-workload fields, `gpuPodCPUSet` and `cpuPodCPUSet` represent policy capacity/reference sets. A normal Kubernetes pod requests an integer CPU count; it does not pass either named set to CPU Manager. Therefore kubelet may assign different valid CPU IDs.
+
+For example:
+
+```text
+policy GPU reference: 0-11
+actual GPU assignment: 1-12
+
+policy CPU reference: 12-47
+actual CPU assignment: 13-46
+```
+
+Treat an exact-ID difference as informational when all of the following are true:
+
+- the requested CPU count is within the applicable policy capacity;
+- the assigned CPU count equals the requested count;
+- CPU Manager records an exclusive assignment for each Guaranteed container;
+- CPU and GPU workload exclusive sets do not overlap;
+- the allocation satisfies configured NUMA and full-core options;
+- process affinity matches the CPU Manager checkpoint/effective container restriction.
+
+Exact named-pool enforcement requires an additional mechanism beyond a normal pod CPU request.
 
 ### Optional: run a real Llama 3.1 8B vLLM serving workload
 
