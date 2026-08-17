@@ -503,6 +503,144 @@ integer CPU request with `CPU_REQUEST=<n>` while the remaining CPUs are
 available for the real serving pod. The default full-capacity generators should
 instead be treated as replacement workloads.
 
+### Transition from paired lightweight CPU/GPU tests to real CPU+GPU vLLM serving
+
+For a `mixed-cpu-amx-gpu` worker, `generate-vllm-cpu-gpu-serving-pods.sh` extends the paired lightweight validation into two real vLLM services on the same worker. It reuses `generate-vllm-cpu-serving-pod.sh` for CPU serving and generates a matching GPU vLLM Pod, Service, and optional OpenShift Route.
+
+The default sizing follows the same semantics as the paired test:
+
+```text
+GPU_CPU_REQUEST = gpuPodReservedCPUs
+
+CPU_POLICY_TARGET =
+    cpuPodCPUSet capacity
+    - (CPU_HEADROOM_PER_NUMA × NUMA_COUNT)
+
+CPU_REQUEST = min(
+    CPU_POLICY_TARGET,
+    scheduler-safe whole-CPU capacity after existing requests and GPU demand
+)
+```
+
+The serving generator excludes `vllm-cpu-test` and `vllm-gpu-test` from existing scheduler demand because they are replacement workloads. This allows the real serving manifests to be generated while the lightweight tests are still alive, but **the lightweight pods must be deleted before the serving pods are applied**. Target serving pod names are also excluded so the generator can be rerun safely while updating an existing serving pair.
+
+Default serving resources are intentionally smaller than the old static CPU+GPU example and can be overridden:
+
+```text
+GPU vLLM: GPU_CPU_REQUEST CPUs, 1 GPU, 32Gi host memory
+CPU vLLM: derived CPU_REQUEST CPUs, 96Gi host memory
+```
+
+The default models are:
+
+```text
+GPU: Qwen/Qwen2.5-7B-Instruct
+CPU: meta-llama/Llama-3.1-8B-Instruct
+```
+
+Create the Hugging Face secret used by the CPU model if it does not already exist:
+
+```bash
+export HF_TOKEN=<your-hugging-face-token>
+oc create secret generic hf-token \
+  -n default \
+  --from-literal=token="${HF_TOKEN}"
+```
+
+Generate the real serving manifests while the lightweight test pods are still available for final inspection:
+
+```bash
+NODE=<worker-node-name> \
+EXPOSE_ROUTES=1 \
+./scripts/generate-vllm-cpu-gpu-serving-pods.sh
+```
+
+For the validated mixed-worker example from section 3.2, the expected sizing is:
+
+```text
+GPU serving CPU request = 12
+CPU serving CPU request = 34
+combined exclusive CPU request = 46
+```
+
+Capture the lightweight result before replacement:
+
+```bash
+LIVE=1 VIEW=both \
+  scripts/show-pod-cpus-grouped.sh "${NODE}" \
+  'vllm-cpu-test|vllm-gpu-test'
+```
+
+Delete both lightweight pods and wait for kubelet to release their exclusive assignments:
+
+```bash
+oc delete pod vllm-cpu-test vllm-gpu-test \
+  -n default --ignore-not-found
+
+oc wait --for=delete pod/vllm-cpu-test \
+  -n default --timeout=120s 2>/dev/null || true
+oc wait --for=delete pod/vllm-gpu-test \
+  -n default --timeout=120s 2>/dev/null || true
+```
+
+Apply GPU serving first, then CPU serving, matching the successful lightweight admission order:
+
+```bash
+oc apply -f examples/vllm-gpu-serving.generated.yaml
+oc wait --for=condition=Ready \
+  pod/vllm-gpu-serving -n default --timeout=600s
+
+oc apply -f examples/vllm-cpu-serving.generated.yaml
+oc wait --for=condition=Ready \
+  pod/vllm-cpu-serving -n default --timeout=600s
+```
+
+Follow startup logs independently:
+
+```bash
+oc logs -f vllm-gpu-serving -n default
+oc logs -f vllm-cpu-serving -n default
+```
+
+The generated cluster-internal endpoints are:
+
+```text
+GPU: http://vllm-gpu-serving.default.svc:8000/v1/models
+CPU: http://vllm-cpu-serving.default.svc:8001/v1/models
+```
+
+When `EXPOSE_ROUTES=1`, inspect both OpenShift routes with:
+
+```bash
+oc get route vllm-gpu-serving vllm-cpu-serving -n default
+```
+
+Finally, repeat runtime CPU validation against the real vLLM containers:
+
+```bash
+LIVE=1 VIEW=both \
+  scripts/show-pod-cpus-grouped.sh "${NODE}" \
+  'vllm-cpu-serving|vllm-gpu-serving'
+```
+
+A serving-pair PASS requires both pods to be Running and Guaranteed QoS, the GPU resource to be admitted, the requested exclusive CPU counts to be assigned without overlap, and `manager=live` for both containers. Exact CPU IDs are still kubelet-selected and are not required to equal `gpuPodCPUSet` or `cpuPodCPUSet`.
+
+Useful overrides include:
+
+```bash
+NODE="${NODE}" \
+GPU_REQUEST=2 \
+GPU_TP=2 \
+GPU_MODEL=Qwen/Qwen2.5-32B-Instruct-AWQ \
+GPU_EXTRA_ARGS='--quantization awq --dtype half' \
+CPU_MEMORY=96Gi \
+GPU_MEMORY=32Gi \
+EXPOSE_ROUTES=1 \
+./scripts/generate-vllm-cpu-gpu-serving-pods.sh
+```
+
+If either real serving pod remains `Pending`, inspect `oc describe pod` and the node's allocated resources. If it starts but vLLM fails, debug image/model/runtime issues separately from CPU Operator placement; the CPU placement test has already isolated the kubelet allocation layer.
+
 ### Interpreting exact CPU IDs
 
 `cpuPodCPUSet` represents the policy's CPU capacity/reference set. The generated

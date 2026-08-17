@@ -220,6 +220,40 @@ A successful paired test requires both pods to be Guaranteed QoS, both to receiv
 
 A shared CPU set is an allowed scheduling boundary, not evidence that every pod is actively consuming every CPU. See [Testing and Validation](docs/TESTING.md) for sizing rules, a real mixed-worker example, expected results, and failure localization.
 
+### 6. Transition a mixed worker to real CPU+GPU vLLM serving
+
+After the lightweight paired test passes, generate real CPU and GPU vLLM serving workloads with the same policy-driven CPU sizing:
+
+```bash
+NODE="${NODE}" \
+EXPOSE_ROUTES=1 \
+./scripts/generate-vllm-cpu-gpu-serving-pods.sh
+```
+
+The mixed-serving generator assigns the GPU serving pod the full `gpuPodReservedCPUs` CPU budget and derives the CPU serving request from `cpuPodCPUSet` capacity, per-NUMA headroom, existing scheduler CPU requests, and the paired GPU demand. Lightweight `vllm-cpu-test` and `vllm-gpu-test` pods are treated as replacement workloads during sizing, but must be deleted before the real serving pods are applied.
+
+```bash
+# Preserve the lightweight runtime result first.
+LIVE=1 VIEW=both \
+  scripts/show-pod-cpus-grouped.sh "${NODE}" \
+  'vllm-cpu-test|vllm-gpu-test'
+
+oc delete pod vllm-cpu-test vllm-gpu-test -n default --ignore-not-found
+
+# Admit the real GPU+CPU request first, then the CPU serving workload.
+oc apply -f examples/vllm-gpu-serving.generated.yaml
+oc wait --for=condition=Ready pod/vllm-gpu-serving -n default --timeout=600s
+
+oc apply -f examples/vllm-cpu-serving.generated.yaml
+oc wait --for=condition=Ready pod/vllm-cpu-serving -n default --timeout=600s
+
+LIVE=1 VIEW=both \
+  scripts/show-pod-cpus-grouped.sh "${NODE}" \
+  'vllm-cpu-serving|vllm-gpu-serving'
+```
+
+The default GPU model is `Qwen/Qwen2.5-7B-Instruct`; the default CPU model remains `meta-llama/Llama-3.1-8B-Instruct`. Images, models, memory sizes, tensor parallelism, GPU count, and route generation are all configurable through environment variables. See [Testing and Validation](docs/TESTING.md) for the complete transition procedure.
+
 ## Provider modes
 
 | Provider | Apply mode | Behavior |
